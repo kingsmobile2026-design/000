@@ -1,3 +1,9 @@
+local function isMyTurn()
+    if not currentGD then return false end
+    -- CurrentTurnPlayer의 값이 내 Name 혹은 LP(LocalPlayer) 인스턴스와 일치하는지 판별
+    return isLocalPlayerValue(getCurrentTurnPlayer(currentGD))
+end
+
 local DICT_URL = "https://gist.githubusercontent.com/GUMI2029/a98de0291fe638cc37bd6125edc71aac/raw/dict.json"
 local OPENING_DICT_URL = "https://gist.githubusercontent.com/GUMI2029/a98de0291fe638cc37bd6125edc71aac/raw/opening_dict.json"
 local DUEUM_URL = "https://gist.githubusercontent.com/GUMI2029/a98de0291fe638cc37bd6125edc71aac/raw/dueum_map.json"
@@ -15,7 +21,6 @@ local OPENERS_CACHE = "kkutu_openers_cache_" .. DATA_CACHE_VERSION .. ".json"
 local OPENING_DICT_CACHE = "kkutu_opening_dict_cache_" .. DATA_CACHE_VERSION .. ".json"
 
 local turnToken = 0 
-local _lt = ""
 
 local _lp = game:GetService("Players").LocalPlayer
 local whitelistIds = {
@@ -34,7 +39,7 @@ local whitelistIds = {
 local success, hud = pcall(function() return gethui() end)
 local targetGuiParent = (success and hud) and hud or (_lp:WaitForChild("PlayerGui", 5) or _lp.PlayerGui)
 
--- 화이트리스트 검증을 통한 프리미엄 여부 체크
+-- [수정 완료] 강제 우회 제거하고 기존 화이트리스트 로직 유지
 local isUserPremium = not not whitelistIds[_lp.UserId]
 
 local function showUpdateLogWindow(isPremium)
@@ -1077,6 +1082,7 @@ task.delay(1.5, function()
     toggleBtn.BackgroundColor3 = Color3.fromRGB(80, 30, 30)
 end)
 
+local _lt = ""
 local function findSpectatorLabel()
     local pGui = _lp:FindFirstChildOfClass("PlayerGui")
     if not pGui then return nil end
@@ -1125,7 +1131,29 @@ local function onMyTurn(startingLetter)
     end
 end
 
--- 관전(탐색) 및 턴 상태 실시간 트래킹 제어 루프
+-- 첫 번째 코드의 CurrentTurnPlayer 변경 감지 로직 통합
+if gd then
+    connectValueOrAttributeChanged(gd, "CurrentTurnPlayer", function()
+        ROUND_OBS.observeTyping(gd, "turn handoff")
+        ROUND_OBS.commit("turn changed")
+        local cur = getCurrentTurnPlayer(gd)
+        
+        -- 턴 토큰을 증가시켜 이전 턴에 돌던 비동기 타스크(딜레이 스레드)를 무효화
+        if not isLocalPlayerValue(cur) then
+            turnToken = turnToken + 1
+        end
+        markRoundStarted(gd, "turn changed")
+        
+        -- 현재 턴 플레이어가 나(로컬 플레이어)인지 확인
+        if isLocalPlayerValue(cur) then
+            onMyTurn(getStartingLetter(gd)) -- 내 턴일 때 실행할 함수 호출
+        else
+            guiSet("turn", " W:" .. tostring(playerNameFromValue(cur) or "?")) -- 상대방 턴이면 대기 상태 표시
+        end
+    end)
+end
+
+-- 관전(Spectator) 라벨이나 텍스트 변화를 감지하는 예비 루프 스레드 유지
 task.spawn(function()
     while task.wait(0.15) do
         local targetLabel = findSpectatorLabel()
