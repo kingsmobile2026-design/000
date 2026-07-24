@@ -488,7 +488,7 @@ local subLoadLabel = Instance.new("TextLabel", contentHolder)
 subLoadLabel.Size = UDim2.new(0, 400, 0, 25)
 subLoadLabel.Position = UDim2.new(0.5, -200, 0.5, 15)
 subLoadLabel.BackgroundTransparency = 1
-subLoadLabel.Text = "— Black's COMPACT SCRIPT —"
+subLoadLabel.Text = "— WHITE's COMPACT SCRIPT —"
 subLoadLabel.TextColor3 = Color3.fromRGB(0, 255, 140)
 subLoadLabel.Font = Enum.Font.Code
 subLoadLabel.TextSize = 13
@@ -649,7 +649,7 @@ local speedLabel = Instance.new("TextLabel", dictPanel)
 speedLabel.Size = UDim2.new(1, 0, 0, 14 * uiScale)
 speedLabel.Position = UDim2.new(0, 0, 0, 62 * uiScale)
 speedLabel.BackgroundTransparency = 1
-speedLabel.Text = "타이핑 속도 (타/분)"
+speedLabel.Text = "타자속도(0=즉시입력)"
 speedLabel.TextColor3 = Color3.fromRGB(150, 150, 160)
 speedLabel.Font = Enum.Font.SourceSansBold
 speedLabel.TextSize = math.round(10 * uiScale)
@@ -669,7 +669,7 @@ local killSelfBtn = Instance.new("TextButton", dictPanel)
 killSelfBtn.Size = UDim2.new(1, -10 * uiScale, 0, 24 * uiScale)
 killSelfBtn.Position = UDim2.new(0, 5 * uiScale, 0, 108 * uiScale)
 killSelfBtn.BackgroundColor3 = Color3.fromRGB(110, 30, 30)
-killSelfBtn.Text = "자살(포기) 패킷"
+killSelfBtn.Text = "자살"
 killSelfBtn.TextColor3 = Color3.new(1, 1, 1)
 killSelfBtn.Font = Enum.Font.SourceSansBold
 killSelfBtn.TextSize = math.round(11 * uiScale)
@@ -749,7 +749,7 @@ local chatSpamBtn = Instance.new("TextButton", spamPanel)
 chatSpamBtn.Size = UDim2.new(1, -10 * uiScale, 0, 26 * uiScale)
 chatSpamBtn.Position = UDim2.new(0, 5 * uiScale, 0, 120 * uiScale)
 chatSpamBtn.BackgroundColor3 = Color3.fromRGB(200, 110, 0)
-chatSpamBtn.Text = "채팅 도배 개시"
+chatSpamBtn.Text = "도배하기"
 chatSpamBtn.TextColor3 = Color3.new(1, 1, 1)
 chatSpamBtn.Font = Enum.Font.SourceSansBold
 chatSpamBtn.TextSize = math.round(11 * uiScale)
@@ -939,18 +939,18 @@ lbl.TextColor3 = Color3.fromRGB(255, 220, 100)
 lbl.LayoutOrder = orderScore + 10000
 elseif checkIsChobanWord(w) then
 lbl.BackgroundColor3 = Color3.fromRGB(25, 60, 90)
-lbl.Text = " ⚡ [방어] " .. w
+lbl.Text = " ⚡ [초반추천] " .. w
 lbl.TextColor3 = Color3.fromRGB(150, 220, 255)
 lbl.LayoutOrder = orderScore + 20000
 else
 lbl.BackgroundColor3 = Color3.fromRGB(40, 42, 48)
-lbl.Text = " 📄 [일반] " .. w
+lbl.Text = " 🛡[방어] " .. w
 lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
 lbl.LayoutOrder = orderScore + 30000
 end
 else
 lbl.BackgroundColor3 = Color3.fromRGB(40, 42, 48)
-lbl.Text = " 📄 " .. w
+lbl.Text = " 🛡 " .. w
 lbl.TextColor3 = Color3.fromRGB(190, 190, 190)
 lbl.LayoutOrder = orderScore
 end
@@ -1067,7 +1067,7 @@ if not isUserPremium and totalCount > visibleCount then
 local lock = Instance.new("TextLabel", scroll)
 lock.Size = UDim2.new(1, -4 * uiScale, 0, 24 * uiScale)
 lock.BackgroundColor3 = Color3.fromRGB(45, 30, 30)
-lock.Text = " 🔒 프리미엄 미등록 유저 단어 제한됨 (" .. (totalCount - visibleCount) .. "개 숨겨짐)"
+lock.Text = " 🔐 프리미엄 미등록 유저 단어 제한됨 (" .. (totalCount - visibleCount) .. "개 숨겨짐)"
 lock.TextColor3 = Color3.fromRGB(255, 120, 120)
 lock.Font = Enum.Font.SourceSansBold
 lock.TextSize = math.round(10 * uiScale)
