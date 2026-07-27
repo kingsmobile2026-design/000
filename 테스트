@@ -1,21 +1,19 @@
 local _lp = game:GetService("Players").LocalPlayer
 local whitelistIds = {
-    [1113284376] = true,
-    [7586170483] = true,
-    [10772004383] = true,
-    [10952233360] = true,
-    [5581274401] = true,
-    [1715644590] = true,
-    [5433849504] = true,
-    [2248980107] = true,
-    [9921082300] = true,
-    [11278301426] = true
+[1113284376] = true,
+[7586170483] = true,
+[10772004383] = true,
+[10952233360] = true,
+[5581274401] = true,
+ [1715644590] = true,
+[5433849504] = true,
+[2248980107] = true,
+[9921082300] = true,
+[11278301426] = true
 }
 
-local function checkIsPremium(player)
-    if not player then return false end
-    return not not whitelistIds[player.UserId]
-end
+local success, hud = pcall(function() return gethui() end)
+local targetGuiParent = (success and hud) and hud or (_lp:WaitForChild("PlayerGui", 5) or _lp.PlayerGui)
 
-local isUserPremium = checkIsPremium(_lp)
-
+-- [수정 완료] 강제 우회 제거하고 기존 화이트리스트 로직 유지
+local isUserPremium = not not whitelistIds[_lp.UserId]
