@@ -1,0 +1,1338 @@
+--!nonstrict
+-- Robscript.com - WHITE'S HUB
+-- Korean Dodgeball (한국 피구) · PlaceId 90696832826220
+-- UI: Robly Airflow (Robscript theme), loaded from GitHub on start.
+
+----------------------------------------------------------------------
+-- 1. Load the UI library
+----------------------------------------------------------------------
+local UI_SOURCES = {
+	"https://raw.githubusercontent.com/bobloscript/Robly_Airflow/main/Source.luau",
+	"https://raw.githubusercontent.com/PookiePepelsss/Airflow-UI/refs/heads/main/Source.luau",
+}
+
+local Airflow
+for _, url in ipairs(UI_SOURCES) do
+	local ok, library = pcall(function()
+		return loadstring(game:HttpGet(url))()
+	end)
+	if ok and type(library) == "table" and type(library.CreateWindow) == "function" then
+		Airflow = library
+		break
+	end
+end
+
+if not Airflow then
+	error("[WHITES_HUB] Airflow UI 로드 실패")
+end
+
+----------------------------------------------------------------------
+-- 2. Robscript theme
+----------------------------------------------------------------------
+local THEME = {
+	Background = Color3.fromHex("#0A0A0C"),
+	Surface = Color3.fromHex("#141418"),
+	Surface2 = Color3.fromHex("#1A1A20"),
+	Surface3 = Color3.fromHex("#2A2A33"),
+	Stroke = Color3.fromHex("#26262E"),
+	StrokeHover = Color3.fromHex("#3C3C49"),
+	Accent = Color3.fromHex("#FF3B7F"),
+	AccentDark = Color3.fromHex("#1A0710"),
+	Text = Color3.fromHex("#F5F5F7"),
+	Muted = Color3.fromHex("#8D8D99"),
+}
+
+Airflow.ThemePresets.Robscript = THEME
+Airflow:SetDefaultTheme(THEME)
+
+----------------------------------------------------------------------
+-- 3. Services and game objects
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+
+local LocalPlayer = Players.LocalPlayer
+local DodgeShared = ReplicatedStorage:WaitForChild("DodgeShared")
+local GameState = ReplicatedStorage:WaitForChild("GameState")
+local Remotes = DodgeShared:WaitForChild("Remotes")
+
+local Config = {}
+do
+	local ok, module = pcall(require, DodgeShared:WaitForChild("Config"))
+	if ok and type(module) == "table" then
+		Config = module
+	end
+end
+
+local CATCH_RADIUS = Config.CatchRadius or 4.5
+local CATCH_COOLDOWN = Config.CatchCooldown or 1
+local DODGE_COOLDOWN = Config.DodgeCooldown or 5
+
+local GENERATION = (_G.WhitesHubGeneration or 0) + 1
+_G.WhitesHubGeneration = GENERATION
+
+local function isCurrentGeneration()
+	return _G.WhitesHubGeneration == GENERATION
+end
+
+for _, previous in ipairs({ _G.WHITES_HUB, _G.PIGU, _G.DodgeHub }) do
+	if type(previous) == "table" and typeof(previous.Window) == "Instance" then
+		pcall(function()
+			previous.Window:Destroy()
+		end)
+	end
+end
+
+pcall(function()
+	for _, name in ipairs({ "WHITES_HUB_ESP", "PIGU_ESP", "DodgeHubESP" }) do
+		local oldGui = gethui():FindFirstChild(name)
+		if oldGui then
+			oldGui:Destroy()
+		end
+	end
+end)
+
+----------------------------------------------------------------------
+-- 4. Window
+----------------------------------------------------------------------
+local Window = Airflow:CreateWindow({
+	Name = "WHITE'S HUB",
+	LoadingSubtitle = "whites hub · combat · visuals",
+	ToggleUIKeybind = "RightControl",
+	Size = UDim2.fromOffset(780, 540),
+	Backdrop = { Weather = "Fireflies", Tint = 0.35 },
+	Theme = THEME,
+	ConfigurationSaving = { Enabled = true, FolderName = "WHITES_HUB" },
+	Home = {
+		Title = "WHITE'S HUB",
+		Welcome = "User,",
+		Tier = "v1.0",
+		Stats = { "Players", "Session", "FPS", "Ping", "Game", "Executor" },
+	},
+})
+
+----------------------------------------------------------------------
+-- 5. Flag helper
+----------------------------------------------------------------------
+local state = {}
+
+local function flag(name)
+	local handle = Airflow.Flags and Airflow.Flags[name]
+	if handle then
+		local ok, value = pcall(function()
+			return handle:Get()
+		end)
+		if ok and value ~= nil then
+			return value
+		end
+	end
+	return state[name]
+end
+
+local function num(name, fallback)
+	local value = flag(name)
+	if type(value) == "number" then
+		return value
+	end
+	return fallback
+end
+
+----------------------------------------------------------------------
+-- 6. Game helpers
+----------------------------------------------------------------------
+local function getCharacter()
+	return LocalPlayer.Character
+end
+
+local function getRoot()
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	return character:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHumanoid()
+	local character = getCharacter()
+	if not character then
+		return nil
+	end
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function isInRound()
+	return LocalPlayer:GetAttribute("InRound") == true
+end
+
+local function isAlive()
+	return LocalPlayer:GetAttribute("Alive") == true
+end
+
+local function isHolder()
+	return GameState:GetAttribute("HolderId") == LocalPlayer.UserId
+end
+
+local function collectTargets()
+	local list = {}
+	local myCharacter = getCharacter()
+	for _, model in ipairs(Workspace:GetChildren()) do
+		if model:IsA("Model") and model ~= myCharacter and model:GetAttribute("InGame") == true then
+			local root = model:FindFirstChild("HumanoidRootPart")
+			if root then
+				local player = Players:GetPlayerFromCharacter(model)
+				local userId = 0
+				if player then
+					userId = player.UserId
+				else
+					local botIndex = model.Name:match("^봇(%d+)$")
+					if botIndex then
+						userId = -tonumber(botIndex)
+					end
+				end
+
+				local hp = 0
+				local coins = 0
+				local rankRP = 0
+				local alive = true
+				if player then
+					hp = player:GetAttribute("HP") or 0
+					coins = player:GetAttribute("Coins") or 0
+					rankRP = player:GetAttribute("RankRP") or 0
+					local attr = player:GetAttribute("Alive")
+					alive = attr == nil and true or attr == true
+				end
+
+				list[#list + 1] = {
+					model = model,
+					root = root,
+					player = player,
+					name = player and player.DisplayName or model.Name,
+					userId = userId,
+					hp = hp,
+					coins = coins,
+					rankRP = rankRP,
+					alive = alive,
+				}
+			end
+		end
+	end
+	return list
+end
+
+-- [개선] 화면(OnScreen) 안에 들어온 사람 중에서만 가장 가까운 사람 타겟팅
+local function bestTarget()
+	local root = getRoot()
+	if not root then
+		return nil
+	end
+
+	local camera = Workspace.CurrentCamera
+	if not camera then return nil end
+
+	local myPosition = root.Position
+	local maxRange = num("AimFOV", 0)
+	local priority = flag("TargetPriority") or "Nearest"
+	local best, bestScore = nil, math.huge
+
+	for _, target in ipairs(collectTargets()) do
+		if target.alive then
+			-- 카메라 화면에 들어와 있는지(OnScreen) 체크
+			local _, onScreen = camera:WorldToViewportPoint(target.root.Position)
+			if onScreen then
+				local distance = (target.root.Position - myPosition).Magnitude
+				local inRange = maxRange <= 0 or distance <= maxRange
+				if inRange and distance > 1 then
+					local score = distance
+					if priority == "Lowest HP" then
+						score = target.hp
+					elseif priority == "Most RP" then
+						score = -target.rankRP
+					elseif priority == "Most Coins" then
+						score = -target.coins
+					elseif priority == "Ball Holder (threat)" then
+						score = (GameState:GetAttribute("HolderId") == target.userId) and -1 or distance
+					end
+
+					if score < bestScore then
+						bestScore, best = score, target
+					end
+				end
+			end
+		end
+	end
+
+	return best
+end
+
+local function throwAt(target)
+	local root = getRoot()
+	if not (root and target) then
+		return false, "대상이 없습니다"
+	end
+	if GameState:GetAttribute("State") ~= "Playing" then
+		return false, "라운드 중이 아닙니다"
+	end
+	if not isHolder() then
+		return false, "공을 들고 있지 않습니다"
+	end
+
+	local delta = Vector3.new(
+		target.root.Position.X - root.Position.X,
+		0,
+		target.root.Position.Z - root.Position.Z
+	)
+	if delta.Magnitude < 1 then
+		return false, "대상이 너무 가깝습니다"
+	end
+
+	local mode = flag("PowerMode") or "Perfect"
+	local power = 1
+	if mode == "Fixed" then
+		power = num("PowerValue", 1)
+	elseif mode == "Random" then
+		power = 0.55 + math.random() * 0.45
+	end
+	power = math.clamp(power, 0, 1)
+
+	local curve = num("ThrowCurve", 0)
+	curve = math.clamp(curve, -1, 1)
+
+	Remotes.RequestCharge:FireServer(true)
+	task.wait(0.04)
+	Remotes.RequestThrow:FireServer(power, delta.Unit, curve, target.userId)
+
+	return true
+end
+
+local function ballEta()
+	if GameState:GetAttribute("BallState") ~= "Live" then
+		return nil
+	end
+
+	local ball = Workspace:FindFirstChild("DodgeBall")
+	local root = getRoot()
+	if not (ball and root) then
+		return nil
+	end
+
+	local velocity = ball.AssemblyLinearVelocity
+	local flat = Vector3.new(velocity.X, 0, velocity.Z)
+	local speed = flat.Magnitude
+	if speed < 20 then
+		return nil
+	end
+
+	local direction = flat / speed
+	local toMe = Vector3.new(
+		root.Position.X - ball.Position.X,
+		0,
+		root.Position.Z - ball.Position.Z
+	)
+	local along = toMe:Dot(direction)
+	local lateral = (toMe - direction * along).Magnitude
+
+	if along < -1 then
+		return nil
+	end
+	if lateral > CATCH_RADIUS + 6 then
+		return nil
+	end
+
+	return math.max(along - CATCH_RADIUS, 0) / speed, lateral, along
+end
+
+local function ballDistance()
+	local ball = Workspace:FindFirstChild("DodgeBall")
+	local root = getRoot()
+	if not (ball and root) then
+		return nil
+	end
+	return (ball.Position - root.Position).Magnitude
+end
+
+----------------------------------------------------------------------
+-- 7. Tabs (UI 메뉴 구성)
+----------------------------------------------------------------------
+local LogsTab = Window:CreateTab({ Name = "기록", Icon = "scroll-text" })
+local LogsBox = LogsTab:CreateGroupbox({ Name = "활동", Side = "Left" })
+local Log = LogsBox:CreateLog({
+	Name = "이벤트",
+	MaxEntries = 300,
+	MaxRows = 14,
+	Timestamps = true,
+	EmptyText = "아직 기록이 없습니다",
+})
+
+local CombatTab = Window:CreateTab({ Name = "전투", Icon = "crosshair" })
+local ThrowBox = CombatTab:CreateGroupbox({ Name = "던지기", Side = "Left" })
+local DefenseBox = CombatTab:CreateGroupbox({ Name = "방어", Side = "Right" })
+
+ThrowBox:CreateDropdown({
+	Name = "파워 모드",
+	Desc = "Perfect = 최대 데미지",
+	Options = { "Perfect", "Fixed", "Random" },
+	CurrentOption = "Perfect",
+	Flag = "PowerMode",
+	Callback = function(value)
+		state.PowerMode = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "파워 값",
+	Range = { 0, 1 },
+	Increment = 0.05,
+	CurrentValue = 1,
+	Flag = "PowerValue",
+	DependsOn = { Flag = "PowerMode", Value = "Fixed" },
+	Callback = function(value)
+		state.PowerValue = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "커브",
+	Range = { -1, 1 },
+	Increment = 0.1,
+	CurrentValue = 0,
+	Flag = "ThrowCurve",
+	Callback = function(value)
+		state.ThrowCurve = value
+	end,
+})
+
+ThrowBox:CreateDropdown({
+	Name = "타겟 우선순위",
+	Options = { "Nearest", "Lowest HP", "Most RP", "Most Coins", "Ball Holder (threat)" },
+	CurrentOption = "Nearest",
+	Flag = "TargetPriority",
+	Callback = function(value)
+		state.TargetPriority = value
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "타겟 범위",
+	Range = { 0, 300 },
+	Increment = 5,
+	Suffix = " 스터드",
+	CurrentValue = 0,
+	Flag = "AimFOV",
+	Callback = function(value)
+		state.AimFOV = value
+	end,
+})
+
+ThrowBox:CreateKeybind({
+	Name = "던지기 키",
+	Desc = "E는 게임 기본 잡기 키입니다",
+	CurrentKeybind = "R",
+	Flag = "ThrowKey",
+	Callback = function(key)
+		state.ThrowKey = key
+	end,
+})
+
+ThrowBox:CreateToggle({
+	Name = "자동 던지기",
+	Desc = "공을 잡은 후 설정된 시간 동안 대기했다가 자동으로 던집니다",
+	Flag = "AutoThrow",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoThrow = on
+		Log:Push(on and "<Success>자동 던지기 켜짐</Success>" or "<Muted>자동 던지기 꺼짐</Muted>")
+	end,
+})
+
+ThrowBox:CreateSlider({
+	Name = "공 잡고 대기 시간",
+	Range = { 0, 3 },
+	Increment = 0.05,
+	Suffix = " 초",
+	CurrentValue = 0.15,
+	Flag = "AutoThrowDelay",
+	Callback = function(value)
+		state.AutoThrowDelay = value
+	end,
+})
+
+ThrowBox:CreateButton({
+	Name = "지금 던지기",
+	Icon = "send",
+	Style = "Primary",
+	Callback = function()
+		task.spawn(function()
+			local target = bestTarget()
+			if not target then
+				Log:Push("<Warning>화면 내에 타겟이 없습니다</Warning>")
+				return
+			end
+			local ok, reason = throwAt(target)
+			if ok then
+				Log:Push("던지기 → <Accent>" .. target.name .. "</Accent>")
+			else
+				Log:Push("<Warning>" .. reason .. "</Warning>")
+			end
+		end)
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "자동 잡기",
+	Desc = "날아오는 공을 자동으로 고정밀 캐치합니다",
+	Flag = "AutoCatch",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoCatch = on
+		Log:Push(on and "<Success>자동 잡기 켜짐</Success>" or "<Muted>자동 잡기 꺼짐</Muted>")
+	end,
+})
+
+DefenseBox:CreateSlider({
+	Name = "잡기 여유 시간",
+	Range = { 0, 1 },
+	Increment = 0.05,
+	Suffix = " 초",
+	CurrentValue = 0.15,
+	Flag = "CatchMargin",
+	Callback = function(value)
+		state.CatchMargin = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "자동 줍기",
+	Desc = "주변에 떨어진 공을 자동으로 줍습니다",
+	Flag = "AutoPickup",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoPickup = on
+	end,
+})
+
+DefenseBox:CreateSlider({
+	Name = "줍기 반경",
+	Range = { 5, 60 },
+	Increment = 5,
+	Suffix = " 스터드",
+	CurrentValue = 25,
+	Flag = "PickupRadius",
+	Callback = function(value)
+		state.PickupRadius = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "자동 회피",
+	Desc = "공이 가까이 올 때 회피를 요청합니다",
+	Flag = "AutoDodge",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoDodge = on
+	end,
+})
+
+DefenseBox:CreateDropdown({
+	Name = "회피 애니메이션",
+	Options = { "Default (auto)", "D_Capoeira", "D_Cartwheel", "D_Slide", "D_Spin", "D_Ninja", "D_Backflip", "D_Matrix" },
+	CurrentOption = "D_Slide",
+	Flag = "DodgeAnim",
+	Callback = function(value)
+		state.DodgeAnim = value
+	end,
+})
+
+DefenseBox:CreateToggle({
+	Name = "자동 스킬",
+	Desc = "쿨타임마다 스킬 사용 (기본: 대시)",
+	Flag = "AutoSkill",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoSkill = on
+	end,
+})
+
+DefenseBox:CreateStatus({
+	Name = "공",
+	Style = "Row",
+	Pin = true,
+	Update = function()
+		local ballState = GameState:GetAttribute("BallState") or "?"
+		local holder = GameState:GetAttribute("HolderId")
+		local owner = "없음"
+		if holder == LocalPlayer.UserId then
+			owner = "나"
+		elseif holder and holder ~= 0 then
+			local player = Players:GetPlayerByUserId(holder)
+			owner = player and player.DisplayName or tostring(holder)
+		end
+		return ("%s · %s"):format(ballState, owner)
+	end,
+})
+
+local VisualsTab = Window:CreateTab({ Name = "비주얼", Icon = "eye" })
+local EspBox = VisualsTab:CreateGroupbox({ Name = "플레이어 ESP", Side = "Left" })
+local BallBox = VisualsTab:CreateGroupbox({ Name = "공 및 라운드", Side = "Right" })
+
+EspBox:CreateToggle({
+	Name = "ESP 활성화",
+	Flag = "EspEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.EspEnabled = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "하일라이트",
+	Flag = "EspHighlight",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspHighlight = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "이름",
+	Flag = "EspName",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspName = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "체력 및 거리",
+	Flag = "EspHealth",
+	CurrentValue = true,
+	Callback = function(on)
+		state.EspHealth = on
+	end,
+})
+
+EspBox:CreateToggle({
+	Name = "추적선 (Tracers)",
+	Flag = "EspTracer",
+	CurrentValue = false,
+	Callback = function(on)
+		state.EspTracer = on
+	end,
+})
+
+EspBox:CreateSlider({
+	Name = "최대 거리",
+	Range = { 50, 500 },
+	Increment = 25,
+	Suffix = " 스터드",
+	CurrentValue = 300,
+	Flag = "EspDistance",
+	Callback = function(value)
+		state.EspDistance = value
+	end,
+})
+
+EspBox:CreateColorPicker({
+	Name = "ESP 색상",
+	Color = Color3.fromHex("#FF3B7F"),
+	Flag = "EspColor",
+	Callback = function(color)
+		state.EspColor = color
+	end,
+})
+
+BallBox:CreateToggle({
+	Name = "공 ESP",
+	Flag = "BallEsp",
+	CurrentValue = true,
+	Callback = function(on)
+		state.BallEsp = on
+	end,
+})
+
+BallBox:CreateToggle({
+	Name = "날아오는 공 경고",
+	Flag = "BallWarn",
+	CurrentValue = true,
+	Callback = function(on)
+		state.BallWarn = on
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "라운드",
+	Style = "Row",
+	Pin = true,
+	UpdateRate = 0.5,
+	Update = function()
+		local stateName = GameState:GetAttribute("State") or "?"
+		local timeLeft = GameState:GetAttribute("TimeLeft") or 0
+		local alive = GameState:GetAttribute("Alive") or 0
+		return ("%s · %s초 · 생존 %d"):format(stateName, math.floor(timeLeft), alive)
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "맵",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		local mapName = GameState:GetAttribute("MapName") or "?"
+		local tags = {}
+		if GameState:GetAttribute("Rush") then
+			table.insert(tags, "RUSH")
+		end
+		if GameState:GetAttribute("SuddenDeath") then
+			table.insert(tags, "SUDDEN")
+		end
+		local rally = GameState:GetAttribute("Rally") or 0
+		if rally and rally > 0 then
+			table.insert(tags, "rally x" .. tostring(rally))
+		end
+		local suffix = #tags > 0 and (" · " .. table.concat(tags, " · ")) or ""
+		return mapName .. suffix
+	end,
+})
+
+BallBox:CreateStatus({
+	Name = "내 정보",
+	Style = "Row",
+	UpdateRate = 0.3,
+	Update = function()
+		local hp = LocalPlayer:GetAttribute("HP") or 0
+		local where
+		if isInRound() then
+			where = isAlive() and "<Success>라운드 중</Success>" or "<Error>탈락함</Error>"
+		else
+			where = "<Muted>대기실</Muted>"
+		end
+		return ("%d HP · %s"):format(hp, where)
+	end,
+})
+
+local MoveTab = Window:CreateTab({ Name = "이동", Icon = "move" })
+local MoveBox = MoveTab:CreateGroupbox({ Name = "캐릭터", Side = "Left" })
+
+MoveBox:CreateToggle({
+	Name = "스피드",
+	Flag = "SpeedEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.SpeedEnabled = on
+		if not on then
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.WalkSpeed = 30
+			end
+		end
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "이동 속도",
+	Range = { 16, 200 },
+	Increment = 2,
+	CurrentValue = 60,
+	Flag = "WalkSpeed",
+	DependsOn = "SpeedEnabled",
+	Callback = function(value)
+		state.WalkSpeed = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "점프",
+	Flag = "JumpEnabled",
+	CurrentValue = false,
+	Callback = function(on)
+		state.JumpEnabled = on
+		if not on then
+			local humanoid = getHumanoid()
+			if humanoid then
+				humanoid.JumpPower = 50
+			end
+		end
+	end,
+})
+
+MoveBox:CreateSlider({
+	Name = "점프 파워",
+	Range = { 50, 300 },
+	Increment = 5,
+	CurrentValue = 100,
+	Flag = "JumpPower",
+	DependsOn = "JumpEnabled",
+	Callback = function(value)
+		state.JumpPower = value
+	end,
+})
+
+MoveBox:CreateToggle({
+	Name = "무한 점프",
+	Flag = "InfJump",
+	CurrentValue = false,
+	Callback = function(on)
+		state.InfJump = on
+	end,
+})
+
+MoveBox:CreateDivider({ Text = "세션" })
+
+MoveBox:CreateStatus({
+	Name = "던진 횟수",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(state.thrownCount or 0)
+	end,
+})
+
+MoveBox:CreateStatus({
+	Name = "잡은 횟수",
+	Style = "Row",
+	UpdateRate = 1,
+	Update = function()
+		return tostring(state.caughtCount or 0)
+	end,
+})
+
+local AutoTab = Window:CreateTab({ Name = "자동", Icon = "bot" })
+local AutoBox = AutoTab:CreateGroupbox({ Name = "자동화", Side = "Left" })
+
+AutoBox:CreateToggle({
+	Name = "자동 참가",
+	Desc = "휴식 시간 동안 자동으로 참가",
+	Flag = "AutoJoin",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AutoJoin = on
+	end,
+})
+
+AutoBox:CreateToggle({
+	Name = "안티 AFK",
+	Desc = "움직임을 유지하여 보상 유지",
+	Flag = "AntiAfk",
+	CurrentValue = false,
+	Callback = function(on)
+		state.AntiAfk = on
+	end,
+})
+
+AutoBox:CreateButton({
+	Name = "일일 보상 받기",
+	Icon = "gift",
+	Callback = function()
+		task.spawn(function()
+			local ok, result = pcall(function()
+				return Remotes.ClaimDaily:InvokeServer()
+			end)
+			if ok then
+				Log:Push("<Success>일일 보상 수령 완료</Success>")
+			else
+				Log:Push("<Error>실패: " .. tostring(result) .. "</Error>")
+			end
+		end)
+	end,
+})
+
+AutoBox:CreateButton({
+	Name = "게임 상태 덤프",
+	Icon = "info",
+	Callback = function()
+		local parts = {
+			"State=" .. tostring(GameState:GetAttribute("State")),
+			"BallState=" .. tostring(GameState:GetAttribute("BallState")),
+			"HolderId=" .. tostring(GameState:GetAttribute("HolderId")),
+			"Alive=" .. tostring(GameState:GetAttribute("Alive")),
+			"TimeLeft=" .. tostring(GameState:GetAttribute("TimeLeft")),
+			"Map=" .. tostring(GameState:GetAttribute("MapName")),
+		}
+		Log:Push("<Accent>" .. table.concat(parts, " · ") .. "</Accent>")
+	end,
+})
+
+----------------------------------------------------------------------
+-- 8. ESP
+----------------------------------------------------------------------
+local espFolder = Instance.new("Folder")
+espFolder.Name = "WHITES_HUB_ESP"
+pcall(function()
+	espFolder.Parent = gethui()
+end)
+if not espFolder.Parent then
+	espFolder.Parent = game:GetService("CoreGui")
+end
+
+local espEntries = {}
+
+local function destroyEspEntry(userId)
+	local entry = espEntries[userId]
+	if not entry then
+		return
+	end
+	if entry.highlight then
+		entry.highlight:Destroy()
+	end
+	if entry.billboard then
+		entry.billboard:Destroy()
+	end
+	if entry.tracer then
+		entry.tracer:Remove()
+	end
+	espEntries[userId] = nil
+end
+
+local function ensureEspEntry(target)
+	local entry = espEntries[target.userId]
+	if entry and entry.model ~= target.model then
+		destroyEspEntry(target.userId)
+		entry = nil
+	end
+
+	if not entry then
+		entry = { model = target.model }
+		espEntries[target.userId] = entry
+	end
+
+	if not entry.billboard then
+		local billboard = Instance.new("BillboardGui")
+		billboard.Name = "WHITES_HUB_Tag"
+		billboard.Size = UDim2.fromOffset(150, 38)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Adornee = target.root
+		billboard.Parent = espFolder
+
+		local label = Instance.new("TextLabel")
+		label.Name = "Text"
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamMedium
+		label.TextSize = 13
+		label.TextColor3 = Color3.new(1, 1, 1)
+		label.TextStrokeTransparency = 0.3
+		label.TextStrokeColor3 = Color3.new(0, 0, 0)
+		label.TextWrapped = true
+		label.Parent = billboard
+
+		entry.billboard = billboard
+		entry.label = label
+	end
+
+	entry.billboard.Adornee = target.root
+	return entry
+end
+
+local function updateEsp()
+	local enabled = flag("EspEnabled")
+	local root = getRoot()
+	local color = state.EspColor or THEME.Accent
+	local maxDistance = num("EspDistance", 300)
+	local showName = flag("EspName") ~= false
+	local showHealth = flag("EspHealth") ~= false
+	local showTracer = flag("EspTracer") == true
+	local showHighlight = flag("EspHighlight") ~= false
+
+	if not enabled then
+		for userId in pairs(espEntries) do
+			destroyEspEntry(userId)
+		end
+		return
+	end
+
+	local seen = {}
+	local targets = collectTargets()
+
+	for _, target in ipairs(targets) do
+		local distance = root and (target.root.Position - root.Position).Magnitude or 0
+		if target.alive and distance <= maxDistance then
+			seen[target.userId] = true
+			local entry = ensureEspEntry(target)
+
+			if showHighlight then
+				if not entry.highlight then
+					local highlight = Instance.new("Highlight")
+					highlight.Name = "WHITES_HUB_Highlight"
+					highlight.FillTransparency = 0.65
+					highlight.OutlineTransparency = 0
+					highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+					highlight.Adornee = target.model
+					highlight.Parent = espFolder
+					entry.highlight = highlight
+				end
+				entry.highlight.FillColor = color
+				entry.highlight.OutlineColor = color
+			elseif entry.highlight then
+				entry.highlight:Destroy()
+				entry.highlight = nil
+			end
+
+			local lines = {}
+			if showName then
+				table.insert(lines, target.name)
+			end
+			if showHealth then
+				table.insert(lines, ("%d HP · %d m"):format(math.floor(target.hp), math.floor(distance)))
+			end
+			if entry.label then
+				entry.label.Text = table.concat(lines, "\n")
+				entry.label.TextColor3 = color:Lerp(Color3.new(1, 1, 1), 0.35)
+				entry.label.Visible = #lines > 0
+			end
+
+			if showTracer and root then
+				if not entry.tracer then
+					entry.tracer = Drawing.new("Line")
+					entry.tracer.Thickness = 1
+					entry.tracer.Transparency = 0.7
+				end
+				local screenPoint, onScreen = Workspace.CurrentCamera:WorldToViewportPoint(target.root.Position)
+				if onScreen then
+					entry.tracer.From = Vector2.new(
+						Workspace.CurrentCamera.ViewportSize.X / 2,
+						Workspace.CurrentCamera.ViewportSize.Y
+					)
+					entry.tracer.To = Vector2.new(screenPoint.X, screenPoint.Y)
+					entry.tracer.Color = color
+					entry.tracer.Visible = true
+				else
+					entry.tracer.Visible = false
+				end
+			elseif entry.tracer then
+				entry.tracer:Remove()
+				entry.tracer = nil
+			end
+		else
+			destroyEspEntry(target.userId)
+		end
+	end
+
+	for userId in pairs(espEntries) do
+		if not seen[userId] then
+			destroyEspEntry(userId)
+		end
+	end
+end
+
+local ballHighlight, ballBillboard, ballLabel
+
+local function updateBallEsp()
+	local enabled = flag("BallEsp")
+	local ball = Workspace:FindFirstChild("DodgeBall")
+
+	if not enabled or not ball then
+		if ballHighlight then
+			ballHighlight:Destroy()
+			ballHighlight = nil
+		end
+		if ballBillboard then
+			ballBillboard:Destroy()
+			ballBillboard = nil
+			ballLabel = nil
+		end
+		return
+	end
+
+	if not ballHighlight then
+		ballHighlight = Instance.new("Highlight")
+		ballHighlight.Name = "WHITES_HUB_Ball"
+		ballHighlight.FillColor = Color3.fromHex("#FFD166")
+		ballHighlight.OutlineColor = Color3.fromHex("#FFFFFF")
+		ballHighlight.FillTransparency = 0.4
+		ballHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		ballHighlight.Parent = espFolder
+	end
+	ballHighlight.Adornee = ball
+
+	if not ballBillboard then
+		ballBillboard = Instance.new("BillboardGui")
+		ballBillboard.Name = "WHITES_HUB_BallTag"
+		ballBillboard.Size = UDim2.fromOffset(140, 26)
+		ballBillboard.StudsOffsetWorldSpace = Vector3.new(0, 1.6, 0)
+		ballBillboard.AlwaysOnTop = true
+		ballBillboard.Parent = espFolder
+
+		ballLabel = Instance.new("TextLabel")
+		ballLabel.BackgroundTransparency = 1
+		ballLabel.Size = UDim2.fromScale(1, 1)
+		ballLabel.Font = Enum.Font.GothamMedium
+		ballLabel.TextSize = 12
+		ballLabel.TextColor3 = Color3.fromHex("#FFD166")
+		ballLabel.TextStrokeTransparency = 0.3
+		ballLabel.Parent = ballBillboard
+	end
+
+	ballBillboard.Adornee = ball
+
+	local eta = ballEta()
+	local text
+	if eta then
+		text = ("날아오는 중 · %0.2f초"):format(eta)
+		if state.BallWarn ~= false then
+			ballLabel.TextColor3 = Color3.fromHex("#FF4D4D")
+		end
+	else
+		local distance = ballDistance()
+		text = distance and ("%d m"):format(math.floor(distance)) or "?"
+		ballLabel.TextColor3 = Color3.fromHex("#FFD166")
+	end
+	ballLabel.Text = text
+end
+
+----------------------------------------------------------------------
+-- 9. Settings
+----------------------------------------------------------------------
+local SettingsTab = Window:CreateTab({ Name = "설정", Icon = "settings" })
+SettingsTab:CreateConfigManager({ Name = "설정 파일", Side = "Left" })
+SettingsTab:CreateThemeManager({ Name = "테마", Side = "Right" })
+
+----------------------------------------------------------------------
+-- 10. Runtime loops
+----------------------------------------------------------------------
+local nextThrow = 0
+local nextCatch = 0
+local nextPickup = 0
+local nextDodge = 0
+local nextSkill = 0
+local nextJoin = 0
+local nextAfk = 0
+
+state.thrownCount = 0
+state.caughtCount = 0
+
+local lastHoldState = false
+local holdStartTime = 0
+
+local function throwKeyCode()
+	local value = flag("ThrowKey")
+	if typeof(value) == "EnumItem" then
+		return value
+	end
+	if type(value) == "string" then
+		local ok, code = pcall(function()
+			return Enum.KeyCode[value]
+		end)
+		if ok and code then
+			return code
+		end
+	end
+	return Enum.KeyCode.R
+end
+
+local holdThrowKey = false
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+	if input.KeyCode == throwKeyCode() then
+		holdThrowKey = true
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.KeyCode == throwKeyCode() then
+		holdThrowKey = false
+	end
+end)
+
+UserInputService.JumpRequest:Connect(function()
+	if flag("InfJump") then
+		local humanoid = getHumanoid()
+		if humanoid then
+			humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+	end
+end)
+
+task.spawn(function()
+	while isCurrentGeneration() do
+		local now = os.clock()
+		local inRound = isInRound()
+		local alive = isAlive()
+		local playing = GameState:GetAttribute("State") == "Playing"
+		local holding = isHolder()
+
+		if holding ~= lastHoldState then
+			lastHoldState = holding
+			if holding then
+				holdStartTime = now
+			end
+		end
+
+		local throwDelay = math.max(num("AutoThrowDelay", 0.15), 0)
+		if flag("AutoThrow") and playing and inRound and alive and holding and (now - holdStartTime >= throwDelay) and now >= nextThrow then
+			nextThrow = now + 0.3
+			local target = bestTarget()
+			if target then
+				task.spawn(function()
+					if throwAt(target) then
+						state.thrownCount = (state.thrownCount or 0) + 1
+						Log:Push("자동 → <Accent>" .. target.name .. "</Accent>")
+					end
+				end)
+			end
+		end
+
+		if holdThrowKey and playing and inRound and alive and holding and (now - holdStartTime >= throwDelay) and now >= nextThrow then
+			nextThrow = now + 0.3
+			local target = bestTarget()
+			if target then
+				task.spawn(function()
+					if throwAt(target) then
+						state.thrownCount = (state.thrownCount or 0) + 1
+					end
+				end)
+			end
+		end
+
+		-- [고정밀 자동 잡기 (Auto Catch) - 예측 강도 유지 및 판정 세분화]
+		if flag("AutoCatch") and now >= nextCatch then
+			local eta = ballEta()
+			local ballDist = ballDistance()
+			
+			-- 판정 범위를 4.0 스터드로 촘촘하게 잡고, 공이 다가오는 상황에서 즉각 반응하도록 보강
+			local isPreciseClose = ballDist and ballDist <= 4.0
+			
+			if (eta and eta <= math.max(num("CatchMargin", 0.15), 0.05)) or isPreciseClose then
+				nextCatch = now + CATCH_COOLDOWN
+				
+				-- 0.008초 간격으로 5번 초고속 연사 전송하여 확실하게 캐치
+				task.spawn(function()
+					for i = 1, 5 do
+						pcall(function()
+							Remotes.RequestCatch:FireServer(eta or 0)
+						end)
+						task.wait(0.008)
+					end
+				end)
+				
+				state.caughtCount = (state.caughtCount or 0) + 1
+				Log:Push("<Success>고정밀 잡기 성공! (5연사)</Success>")
+			end
+		end
+
+		-- Auto pickup
+		if flag("AutoPickup") and now >= nextPickup and GameState:GetAttribute("BallState") == "Loose" then
+			local distance = ballDistance()
+			if distance and distance <= num("PickupRadius", 25) then
+				nextPickup = now + 0.3
+				pcall(function()
+					Remotes.RequestPickup:FireServer()
+				end)
+			end
+		end
+
+		-- Auto dodge
+		if flag("AutoDodge") and now >= nextDodge and playing and alive then
+			local eta, lateral = ballEta()
+			if eta and eta <= 0.3 and (lateral or 99) <= CATCH_RADIUS + 8 then
+				nextDodge = now + DODGE_COOLDOWN
+				local anim = flag("DodgeAnim") or "D_Slide"
+				if anim == "Default (auto)" then
+					anim = "D_Dodge"
+				end
+				pcall(function()
+					Remotes.RequestDodge:FireServer(anim)
+				end)
+			end
+		end
+
+		-- Auto skill
+		if flag("AutoSkill") and now >= nextSkill and playing and alive and inRound then
+			local skillName = LocalPlayer:GetAttribute("EquippedSkill") or "Dash"
+			local skill = Config.Skills and Config.Skills[skillName]
+			local cooldown = skill and skill.Cooldown or 12
+			nextSkill = now + cooldown
+			pcall(function()
+				Remotes.RequestSkill:FireServer()
+			end)
+		end
+
+		-- Auto join
+		if flag("AutoJoin") and GameState:GetAttribute("State") ~= "Playing" and not inRound and now >= nextJoin then
+			nextJoin = now + 4
+			pcall(function()
+				Remotes.RequestJoin:FireServer()
+			end)
+			Log:Push("다음 라운드 참가 완료")
+		end
+
+		-- Anti-AFK
+		if flag("AntiAfk") and now >= nextAfk then
+			nextAfk = now + 25
+			local humanoid = getHumanoid()
+			local root = getRoot()
+			if humanoid and root then
+				local direction = Vector3.new(math.random(-1, 1), 0, math.random(-1, 1))
+				if direction.Magnitude < 0.1 then
+					direction = Vector3.new(1, 0, 0)
+				end
+				humanoid:Move(direction.Unit, false)
+				task.wait(0.4)
+				humanoid:Move(Vector3.zero, false)
+			end
+		end
+
+		local humanoid = getHumanoid()
+		if humanoid then
+			if flag("SpeedEnabled") then
+				local speed = num("WalkSpeed", 30)
+				if humanoid.WalkSpeed ~= speed then
+					humanoid.WalkSpeed = speed
+				end
+			end
+			if flag("JumpEnabled") then
+				local power = num("JumpPower", 50)
+				if humanoid.JumpPower ~= power then
+					humanoid.JumpPower = power
+				end
+			end
+		end
+
+		task.wait(0.05)
+	end
+end)
+
+task.spawn(function()
+	while isCurrentGeneration() do
+		local ok, err = pcall(function()
+			updateEsp()
+			updateBallEsp()
+		end)
+		if not ok then
+			warn("[WHITES_HUB] ESP:", tostring(err))
+			Log:Push("<Error>ESP: " .. tostring(err) .. "</Error>")
+			task.wait(2)
+		end
+		task.wait(0.12)
+	end
+end)
+
+----------------------------------------------------------------------
+-- 11. Final
+----------------------------------------------------------------------
+_G.WHITES_HUB = {
+	Window = Window,
+	Flags = Airflow.Flags,
+	State = state,
+	GameState = GameState,
+	Remotes = Remotes,
+	Tabs = {
+		Logs = LogsTab,
+		Combat = CombatTab,
+		Visuals = VisualsTab,
+		Movement = MoveTab,
+		Auto = AutoTab,
+		Settings = SettingsTab,
+	},
+}
+
+Window:LoadAutoload()
+Window:Notify({
+	Title = "WHITE'S HUB",
+	Content = "로드 완료 · RightControl로 숨기기",
+	Type = "Success",
+})
+Log:Push("<Accent>WHITE'S HUB 준비 완료</Accent>")
