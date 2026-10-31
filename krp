@@ -51,7 +51,6 @@ Airflow:SetDefaultTheme(THEME)
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
@@ -115,9 +114,11 @@ local Window = Airflow:CreateWindow({
 })
 
 ----------------------------------------------------------------------
--- 5. Flag helper
+-- 5. Flag helper & Whitelist / Blacklist data
 ----------------------------------------------------------------------
 local state = {}
+local Whitelist = {}
+local Blacklist = {}
 
 local function flag(name)
 	local handle = Airflow.Flags and Airflow.Flags[name]
@@ -210,6 +211,7 @@ local function collectTargets()
 					root = root,
 					player = player,
 					name = player and player.DisplayName or model.Name,
+					rawName = player and player.Name or model.Name,
 					userId = userId,
 					hp = hp,
 					coins = coins,
@@ -222,7 +224,7 @@ local function collectTargets()
 	return list
 end
 
--- [개선] 화면(OnScreen) 안에 들어온 사람 중에서만 가장 가까운 사람 타겟팅
+-- 타겟팅 함수 (블랙리스트 우선, 화이트리스트 제외, 시야 내 최단거리)
 local function bestTarget()
 	local root = getRoot()
 	if not root then
@@ -236,28 +238,53 @@ local function bestTarget()
 	local maxRange = num("AimFOV", 0)
 	local priority = flag("TargetPriority") or "Nearest"
 	local best, bestScore = nil, math.huge
+	local blacklistedTarget = nil
+	local shortestBlacklistDist = math.huge
 
-	for _, target in ipairs(collectTargets()) do
+	local targets = collectTargets()
+
+	-- 1. 블랙리스트에 속한 사람이 있는지 먼저 확인 (거리, 시야, 우선순위 무시하고 무조건 타겟)
+	for _, target in ipairs(targets) do
 		if target.alive then
-			-- 카메라 화면에 들어와 있는지(OnScreen) 체크
-			local _, onScreen = camera:WorldToViewportPoint(target.root.Position)
-			if onScreen then
-				local distance = (target.root.Position - myPosition).Magnitude
-				local inRange = maxRange <= 0 or distance <= maxRange
-				if inRange and distance > 1 then
-					local score = distance
-					if priority == "Lowest HP" then
-						score = target.hp
-					elseif priority == "Most RP" then
-						score = -target.rankRP
-					elseif priority == "Most Coins" then
-						score = -target.coins
-					elseif priority == "Ball Holder (threat)" then
-						score = (GameState:GetAttribute("HolderId") == target.userId) and -1 or distance
-					end
+			if Blacklist[target.name] or Blacklist[target.rawName] then
+				local dist = (target.root.Position - myPosition).Magnitude
+				if dist < shortestBlacklistDist then
+					shortestBlacklistDist = dist
+					blacklistedTarget = target
+				end
+			end
+		end
+	end
 
-					if score < bestScore then
-						bestScore, best = score, target
+	if blacklistedTarget then
+		return blacklistedTarget
+	end
+
+	-- 2. 일반 타겟팅 (화이트리스트 제외 + 카메라 시야 내)
+	for _, target in ipairs(targets) do
+		if target.alive then
+			-- 화이트리스트에 있는 경우 제외
+			local isWhite = Whitelist[target.name] or Whitelist[target.rawName]
+			if not isWhite then
+				local _, onScreen = camera:WorldToViewportPoint(target.root.Position)
+				if onScreen then
+					local distance = (target.root.Position - myPosition).Magnitude
+					local inRange = maxRange <= 0 or distance <= maxRange
+					if inRange and distance > 1 then
+						local score = distance
+						if priority == "Lowest HP" then
+							score = target.hp
+						elseif priority == "Most RP" then
+							score = -target.rankRP
+						elseif priority == "Most Coins" then
+							score = -target.coins
+						elseif priority == "Ball Holder (threat)" then
+							score = (GameState:GetAttribute("HolderId") == target.userId) and -1 or distance
+						end
+
+						if score < bestScore then
+							bestScore, best = score, target
+						end
 					end
 				end
 			end
@@ -467,7 +494,7 @@ ThrowBox:CreateButton({
 		task.spawn(function()
 			local target = bestTarget()
 			if not target then
-				Log:Push("<Warning>화면 내에 타겟이 없습니다</Warning>")
+				Log:Push("<Warning>타겟팅할 대상이 없습니다</Warning>")
 				return
 			end
 			local ok, reason = throwAt(target)
@@ -480,9 +507,53 @@ ThrowBox:CreateButton({
 	end,
 })
 
+-- 화이트리스트 / 블랙리스트 관리 UI 추가
+local ListBox = CombatTab:CreateGroupbox({ Name = "타겟 제어 (화이트/블랙리스트)", Side = "Right" })
+
+local targetInputName = ""
+ListBox:CreateInput({
+	Name = "플레이어 이름 입력",
+	Placeholder = "정확한 닉네임 입력",
+	Callback = function(text)
+		targetInputName = text
+	end,
+})
+
+ListBox:CreateButton({
+	Name = "화이트리스트 추가 (절대 안 맞춤)",
+	Icon = "shield-check",
+	Callback = function()
+		if targetInputName ~= "" then
+			Whitelist[targetInputName] = true
+			Log:Push("<Success>화이트리스트 추가: " .. targetInputName .. "</Success>")
+		end
+	end,
+})
+
+ListBox:CreateButton({
+	Name = "블랙리스트 추가 (무조건 타겟)",
+	Icon = "crosshair",
+	Callback = function()
+		if targetInputName ~= "" then
+			Blacklist[targetInputName] = true
+			Log:Push("<Error>블랙리스트 추가: " .. targetInputName .. "</Error>")
+		end
+	end,
+})
+
+ListBox:CreateButton({
+	Name = "목록 초기화",
+	Icon = "trash-2",
+	Callback = function()
+		Whitelist = {}
+		Blacklist = {}
+		Log:Push("<Muted>화이트/블랙리스트가 초기화되었습니다</Muted>")
+	end,
+})
+
 DefenseBox:CreateToggle({
 	Name = "자동 잡기",
-	Desc = "날아오는 공을 자동으로 고정밀 캐치합니다",
+	Desc = "날아오는 공을 고정밀 캐치합니다 (3연사)",
 	Flag = "AutoCatch",
 	CurrentValue = false,
 	Callback = function(on)
@@ -1187,29 +1258,28 @@ task.spawn(function()
 			end
 		end
 
-		-- [고정밀 자동 잡기 (Auto Catch) - 예측 강도 유지 및 판정 세분화]
+		-- [자동 잡기 (Auto Catch) - 정확히 3번 전송]
 		if flag("AutoCatch") and now >= nextCatch then
 			local eta = ballEta()
 			local ballDist = ballDistance()
 			
-			-- 판정 범위를 4.0 스터드로 촘촘하게 잡고, 공이 다가오는 상황에서 즉각 반응하도록 보강
 			local isPreciseClose = ballDist and ballDist <= 4.0
 			
 			if (eta and eta <= math.max(num("CatchMargin", 0.15), 0.05)) or isPreciseClose then
 				nextCatch = now + CATCH_COOLDOWN
 				
-				-- 0.008초 간격으로 5번 초고속 연사 전송하여 확실하게 캐치
+				-- 0.01초 간격으로 정확히 3번만 전송
 				task.spawn(function()
-					for i = 1, 5 do
+					for i = 1, 3 do
 						pcall(function()
 							Remotes.RequestCatch:FireServer(eta or 0)
 						end)
-						task.wait(0.008)
+						task.wait(0.01)
 					end
 				end)
 				
 				state.caughtCount = (state.caughtCount or 0) + 1
-				Log:Push("<Success>고정밀 잡기 성공! (5연사)</Success>")
+				Log:Push("<Success>고정밀 잡기 성공! (3연사)</Success>")
 			end
 		end
 
