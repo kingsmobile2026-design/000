@@ -4838,10 +4838,11 @@ function obfImpl(src, opts) {
       };
     } catch (e) {
       vmFallbackReason = e && e.message ? e.message : String(e);
-      // Mandatory-VM policy: never silently downgrade to source/source-lite mode.
-      // Surface the emitter failure so the incomplete VM output cannot be mistaken
-      // for a successful build. Fixing the underlying emitter is required to proceed.
-      throw new Error("Mandatory VM build failed; source fallback is disabled: " + vmFallbackReason);
+      // Server V2: prefer a successful source-mode build over a hard failure.
+      // The original client policy blocked fallback; for API use we continue with
+      // non-VM transforms and report the VM failure as a warning.
+      warnings.push("VM build failed (" + String(vmFallbackReason).slice(0, 240) + "); fell back to source-mode obfuscation. Disable Bytecode VM or simplify unsupported syntax if you need pure VM output.");
+      // fall through to source-mode path below
     }
   }
 
