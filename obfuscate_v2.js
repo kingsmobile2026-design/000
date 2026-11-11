@@ -1,5 +1,16 @@
 "use strict";
-/* WSFuscate V2 server engine */
+/* WSFuscate V8.2.6 server-only engine. This runtime guard prevents accidental
+   browser execution/bundling; it is not a cryptographic distribution boundary. */
+const __WSF_NODE_SERVER_RUNTIME =
+  typeof process === "object" && process !== null &&
+  process.release && process.release.name === "node" &&
+  process.versions && typeof process.versions.node === "string" &&
+  typeof Buffer === "function" && typeof module === "object" &&
+  module !== null && typeof module.require === "function";
+if (!__WSF_NODE_SERVER_RUNTIME) {
+  throw new Error("WSFuscate V8.2 is server-only. Use the authenticated server API; do not bundle this engine in a client.");
+}
+/* WSFuscate V8.2 server-only: randomized anonymous micro-op closure pool + indirect constant dispatch + hardened runtime probes */
 const performance = globalThis.performance || { now: () => Date.now() };
 const window = globalThis;
 const localStorage = {
@@ -1253,9 +1264,8 @@ function assignName(name, expr) {
 /* Security hardening: never silently downgrade to Math.random(). This is build-time
    obfuscation randomness, not a substitute for server-side protection. */
 let __wsSeededRandom = null;
-function secureRandomFloat() {
-  // A fixed seed intentionally makes output reproducible; it is NOT secure randomness.
-  if (__wsSeededRandom) return __wsSeededRandom();
+let __wsDeterministicKeyOptIn = false;
+function __wsCryptoRandomFloat() {
   try {
     if (typeof crypto !== "undefined" && crypto && typeof crypto.getRandomValues === "function") {
       const word = new Uint32Array(1);
@@ -1263,7 +1273,18 @@ function secureRandomFloat() {
       return word[0] / 0x100000000;
     }
   } catch (_) {}
-  throw new Error("Secure randomness is unavailable. Open this tool over HTTPS or trusted localhost; do not use a fixed seed for security-sensitive builds.");
+  throw new Error("Secure randomness is unavailable. Use HTTPS or trusted localhost; deterministic mode is debug-only.");
+}
+function secureRandomFloat() {
+  // Layout/placement stream: seedable for reproducible structural experiments.
+  if (__wsSeededRandom) return __wsSeededRandom();
+  return __wsCryptoRandomFloat();
+}
+function secureKeyFloat() {
+  // Key stream: independent from layout choices in production builds.
+  // A deterministic key stream requires the explicit allowDeterministic opt-in.
+  if (__wsDeterministicKeyOptIn && __wsSeededRandom) return __wsSeededRandom();
+  return __wsCryptoRandomFloat();
 }
 
 /* FIX #8: single If with elseif chain (forward), not reverse-nested elseBody */
@@ -1861,7 +1882,7 @@ function encodeCffStateMachines(ast) {
     }
     const payload = decodePairs.map(([encoded, original]) => `${encoded}:${original}`).join(",");
     const runtimePayload = encStrChain(payload, 2);
-    // Runtime integrity: only the 8-slot __WSIntegrityRing and payload digest are checked.
+    // Runtime integrity: the 16-slot primary/shadow ledger and payload digest are checked.
     // The previous pathDigest/pathCheck duplicate was removed because two calculations of the
     // same recurrence add no detection power; a single fold + reverse fold is enough.
     // CFF payload holds encoded:original only. The affine intermediate is computed at runtime.
@@ -2177,8 +2198,8 @@ function validateVmIsaMaps(opMap, innerOpMap, handlerMap, profile = "balanced") 
       seen.add(id);
     }
   };
-  checkDomain(opMap, "root ISA", 1, 250);
-  checkDomain(innerOpMap, "nested ISA", 1, 250);
+  checkDomain(opMap, "root ISA", 1, 0xFFFFFFFF);
+  checkDomain(innerOpMap, "nested ISA", 1, 0xFFFFFFFF);
   checkDomain(handlerMap, "handler map", 1, 250);
   if (profile === "compact" && opMap !== innerOpMap)
     fail("compact profile must share its single ISA map");
@@ -2226,7 +2247,7 @@ function validateSerializedVmProto(proto, serialized, opMap, profileLabel = "pro
     const ins = logical[pc];
     const offset = map[pc];
     const encoded = words[offset - 1];
-    const id = ((encoded - serialized.opShift - serialized.opShift2) % 251 + 251) % 251;
+    const id = (Number(encoded) - Number(serialized.opShift) - Number(serialized.opShift2)) >>> 0;
     const semantic = inverse.get(id);
     if (semantic !== ins.op) fail("opcode mismatch at PC " + (pc + 1) + ": expected " + ins.op + ", got " + (semantic || "unknown"));
     const schema = VM_OPERAND_SCHEMAS[semantic];
@@ -2248,7 +2269,7 @@ function validateSerializedVmProto(proto, serialized, opMap, profileLabel = "pro
     }
   }
   const sentinelOffset = map[map.length - 1];
-  const sentinelId = ((words[sentinelOffset - 1] - serialized.opShift - serialized.opShift2) % 251 + 251) % 251;
+  const sentinelId = (Number(words[sentinelOffset - 1]) - Number(serialized.opShift) - Number(serialized.opShift2)) >>> 0;
   if (inverse.get(sentinelId) !== "RETURN") fail("logical end sentinel is not RETURN");
   for (let i = 0; i < (proto.protos || []).length; i++) {
     const childOpMap = serialized.protos[i]._validationOpMap;
@@ -2259,44 +2280,74 @@ function validateSerializedVmProto(proto, serialized, opMap, profileLabel = "pro
 }
 
 function makeVmOpcodeMap(profile = "balanced") {
-  // Compact uses a dense shuffled domain. Balanced/hardened use an independently
-  // keyed 20-round Feistel permutation over the 8-bit domain for each prototype.
-  // Reserved values (0, 251..255) are filtered only after permutation. This is
-  // deliberate polymorphic encoding, not cryptographic encryption: 8-bit opcodes
-  // remain enumerable to a determined analyst, so the payload must not contain secrets.
+  // V8.2: sparse unsigned 32-bit IDs. This is a larger representation domain,
+  // not encryption: the client runtime still needs a resolver for every ID.
   const count = VM_OP_LIST.length;
-  if (profile === "compact") {
-    const pool = Array.from({ length: count }, (_, i) => i + 1);
-    for (let i = pool.length - 1; i > 0; i--) {
-      const j = Math.floor(secureRandomFloat() * (i + 1));
-      [pool[i], pool[j]] = [pool[j], pool[i]];
-    }
-    return new Map(VM_OP_LIST.map((name, i) => [name, pool[i]]));
+  if (count < 1 || count > 0xFFFFFFFF) throw new Error("Unsupported VM ISA size");
+  const pool = new Set();
+  while (pool.size < count) {
+    const id = (secureKeyFloat() * 0x100000000) >>> 0;
+    if (id !== 0) pool.add(id);
   }
-  // 8-bit round material is generated afresh for each call, including child prototypes.
-  const roundKeys = Array.from({ length: 20 }, () => secureRandomFloat() * 256 | 0);
-  const permute8 = value => {
-    let left = (value >>> 4) & 15, right = value & 15;
-    for (let r = 0; r < 20; r++) {
-      const k0 = roundKeys[r], k1 = roundKeys[(r + 7) % 20], k2 = roundKeys[(r + 13) % 20];
-      // Nonlinear 4-bit round function; Feistel structure preserves bijectivity.
-      const nonlinear = (right * right + (right ^ (right >>> 1)) * (k2 | 1)) & 255;
-      const f = ((right * (3 + 2 * (k0 & 7)) + (k1 & 15) + r * 7 +
-        (nonlinear >>> 2) + ((k0 >>> 4) ^ k2)) ^ (right >>> 1) ^ (k1 >>> 4)) & 15;
-      const next = left ^ f;
-      left = right; right = next;
-    }
-    return ((left & 15) << 4) | (right & 15);
-  };
-  const pool = [];
-  for (let x = 0; x < 256; x++) {
-    const id = permute8(x);
-    if (id >= 1 && id <= 250) pool.push(id);
+  const ids = Array.from(pool);
+  for (let i = ids.length - 1; i > 0; i--) {
+    const j = secureKeyFloat() * (i + 1) | 0;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
   }
-  // A permutation of all 256 inputs must yield each allowed ID exactly once.
-  if (pool.length !== 250 || count > pool.length || new Set(pool).size !== 250)
-    throw new Error("Invalid nonlinear opcode permutation");
-  return new Map(VM_OP_LIST.map((name, i) => [name, pool[i]]));
+  return new Map(VM_OP_LIST.map((name, i) => [name, ids[i]]));
+}
+
+function deriveOpcodeBlobSeed(p, mapKeyA, mapKeyB) {
+  // Exact 32-bit bitwise mixing mirrored by the Luau decoder.
+  let state = (p.regMul ^ p.regAdd ^ p.regXor ^ p.opShift ^ p.opShift2 ^ p.chainSeed ^
+    (mapKeyA << 16) ^ mapKeyB ^ (p.opcodeSalt || 0)) >>> 0;
+  const values = [
+    p.wordProfile.a,p.wordProfile.b,p.wordProfile.c,p.wordProfile.d,p.wordProfile.e,
+    p.wordProfile.f,p.wordProfile.g,p.wordProfile.ca,p.wordProfile.cb,p.wordProfile.cc,
+    p.wordProfile.cd,p.wordProfile.ce,p.wordProfile.cf,p.wordProfile.cg,p.wordProfile.ch,
+    p.wordProfile.ci,p.wordProfile.cj,p.wordProfile.ck,
+    p.constProfile.ka,p.constProfile.kb,p.constProfile.kc,p.constProfile.kd,
+    p.constProfile.ke,p.constProfile.kf,p.constProfile.kg
+  ];
+  for (const v of values) {
+    const n = Number(v) >>> 0;
+    state = (state ^ n ^ (n << 7) ^ (n >>> 3)) >>> 0;
+    state = (state ^ (state << 13)) >>> 0;
+    state = (state ^ (state >>> 17)) >>> 0;
+    state = (state ^ (state << 5)) >>> 0;
+  }
+  return state || 0x6D2B79F5;
+}
+
+function encodeOpcodeRecords(p, opcodeDecode, mapKeyA, mapKeyB) {
+  const entries = Object.entries(opcodeDecode).map(([id, slot]) => [Number(id), Number(slot)])
+    .sort((a,b) => a[0]-b[0]);
+  const raw = [];
+  let previousCheck = deriveOpcodeBlobSeed(p, mapKeyA, mapKeyB) & 255;
+  for (let record = 0; record < entries.length; record++) {
+    const [id, slot] = entries[record];
+    if (!Number.isInteger(id) || id < 1 || id > 0xFFFFFFFF || !Number.isInteger(slot) || slot < 1 || slot > 250)
+      throw new Error("Invalid sparse 32-bit opcode record");
+    const b0 = id & 255;
+    const b1 = (id >>> 8) & 255;
+    const b2 = (id >>> 16) & 255;
+    const b3 = Math.floor(id / 0x1000000) & 255;
+    const check = (b0*3 + b1*5 + b2*7 + b3*11 + slot*13 + (record+1)*17 + previousCheck*19) & 255;
+    raw.push(b0,b1,b2,b3,slot,check);
+    previousCheck = check;
+  }
+  let state = deriveOpcodeBlobSeed(p, mapKeyA, mapKeyB);
+  let previousCipher = state & 255;
+  const encoded = raw.map((value, index) => {
+    state = (state ^ (state << 13)) >>> 0;
+    state = (state ^ (state >>> 17)) >>> 0;
+    state = (state ^ (state << 5)) >>> 0;
+    const mask = (state >>> ((index % 4) * 8)) & 255;
+    const cipher = (value ^ mask ^ previousCipher) & 255;
+    previousCipher = cipher;
+    return cipher;
+  });
+  return encoded;
 }
 
 function vmWordMask(mask, index, xp = null) {
@@ -2326,19 +2377,43 @@ function serializeProtoNumeric(proto, opMap, layout, shift = 0, innerOpMap = opM
   const selectedOpMap = opMap;
   // Every prototype gets independent opcode rotations. Select a combined shift
   // that cannot encode any live opcode as the reserved zero/HALT value.
-  let localShift = profile === "compact" ? shift : 1 + (secureRandomFloat() * 249 | 0);
-  let localShift2 = profile === "compact" ? shift2 : 1 + (secureRandomFloat() * 249 | 0);
-  const forbiddenShiftSums = new Set(Array.from(selectedOpMap.values(), id => (251 - id) % 251));
+  let localShift = profile === "compact" ? (Number(shift) >>> 0) : (secureKeyFloat() * 0x100000000) >>> 0;
+  let localShift2 = profile === "compact" ? (Number(shift2) >>> 0) : (secureKeyFloat() * 0x100000000) >>> 0;
+  const forbiddenShiftSums = new Set(Array.from(selectedOpMap.values(), id => (-id) >>> 0));
+  const combinedShift = () => (localShift + localShift2) >>> 0;
   let shiftAttempts = 0;
-  while (forbiddenShiftSums.has((localShift + localShift2) % 251) && shiftAttempts++ < 128) {
-    localShift = profile === "compact" ? shift : 1 + (secureRandomFloat() * 249 | 0);
-    localShift2 = profile === "compact" ? shift2 : 1 + (secureRandomFloat() * 249 | 0);
+  while (forbiddenShiftSums.has(combinedShift()) && shiftAttempts++ < 128) {
+    localShift = profile === "compact" ? (Number(shift) >>> 0) : (secureKeyFloat() * 0x100000000) >>> 0;
+    localShift2 = profile === "compact" ? (Number(shift2) >>> 0) : (secureKeyFloat() * 0x100000000) >>> 0;
   }
-  if (forbiddenShiftSums.has((localShift + localShift2) % 251)) {
-    localShift = 1;
-    localShift2 = 250; // combined shift 0 is safe for every nonzero opcode ID
+  if (forbiddenShiftSums.has(combinedShift())) {
+    // Zero rotation is a valid fallback because every randomized ID is nonzero.
+    localShift = 0;
+    localShift2 = 0;
   }
+  const opcodeSalt = (secureKeyFloat() * 0x100000000) >>> 0;
   const physicalHandlers = handlerMap || new Map(VM_OP_LIST.map((name, i) => [name, i + 1]));
+  // Independent decoder polynomials per prototype. The coefficients remain
+  // present in the client payload, but sibling prototypes no longer share one
+  // reusable global decoding parameter set.
+  const wordProfile = {
+    a:1+(secureKeyFloat()*250|0), b:1+(secureKeyFloat()*250|0),
+    c:1+(secureKeyFloat()*250|0), d:2+(secureKeyFloat()*13|0),
+    e:2+(secureKeyFloat()*13|0), f:1+(secureKeyFloat()*250|0),
+    g:1+(secureKeyFloat()*250|0),
+    ca:1+(secureKeyFloat()*250|0), cb:1+(secureKeyFloat()*250|0),
+    cc:1+(secureKeyFloat()*250|0), cd:1+(secureKeyFloat()*250|0),
+    ce:1+(secureKeyFloat()*250|0), cf:1+(secureKeyFloat()*250|0),
+    cg:1+(secureKeyFloat()*250|0), ch:1+(secureKeyFloat()*250|0),
+    ci:2+(secureKeyFloat()*13|0), cj:1+(secureKeyFloat()*250|0),
+    ck:1+(secureKeyFloat()*250|0)
+  };
+  const constProfile = {
+    ka:1+(secureKeyFloat()*250|0), kb:1+(secureKeyFloat()*250|0),
+    kc:1+(secureKeyFloat()*250|0), kd:1+(secureKeyFloat()*250|0),
+    ke:2+(secureKeyFloat()*13|0), kf:1+(secureKeyFloat()*250|0),
+    kg:1+(secureKeyFloat()*250|0)
+  };
   const consts = [];
   const constMap = new Map();
   const addK = (c) => {
@@ -2400,7 +2475,7 @@ function serializeProtoNumeric(proto, opMap, layout, shift = 0, innerOpMap = opM
     if (!Array.isArray(schema)) throw new Error("Missing variable-width operand schema for " + ins.op);
     const shuffledSchema = operandSchemaOrder.get(ins.op);
     if (!Array.isArray(shuffledSchema) || shuffledSchema.length !== schema.length) throw new Error("Invalid per-prototype operand schema order for " + ins.op);
-    code.push((selectedOpMap.get(ins.op) + localShift + localShift2) % 251);
+    code.push((selectedOpMap.get(ins.op) + localShift + localShift2) >>> 0);
     const values = {a:ins.a ?? 0,b,c,bx,sbx};
     for (const field of shuffledSchema) code.push(values[field]);
   }
@@ -2431,7 +2506,7 @@ function serializeProtoNumeric(proto, opMap, layout, shift = 0, innerOpMap = opM
   // Branches that target the logical end land on a real RETURN sentinel. Decoy
   // words are not in instructionMap, so they cannot be decoded as instructions.
   instructionMap.push(code.length + 1);
-  code.push((selectedOpMap.get("RETURN") + localShift + localShift2) % 251, 0, 1);
+  code.push((selectedOpMap.get("RETURN") + localShift + localShift2) >>> 0, 0, 1);
   const opcodeDecode = {};
   // Each prototype's encoded opcode IDs resolve directly to independently shuffled
   // physical handler slots, not to a shared semantic opcode namespace.
@@ -2441,7 +2516,7 @@ function serializeProtoNumeric(proto, opMap, layout, shift = 0, innerOpMap = opM
     // The instruction stream stores opcode IDs AFTER both per-prototype shifts.
     // Runtime indexes P.o with that decoded, shifted value, so the decode vector
     // must be keyed by the same encoded ID (not the unshifted randomized ID).
-    const encodedId = (randomizedId + localShift + localShift2) % 251;
+    const encodedId = (randomizedId + localShift + localShift2) >>> 0;
     if (encodedId === 0) throw new Error("Reserved zero opcode produced for " + name);
     if (opcodeDecode[encodedId] !== undefined) throw new Error("Duplicate encoded opcode ID " + encodedId);
     opcodeDecode[encodedId] = slot;
@@ -2454,8 +2529,9 @@ function serializeProtoNumeric(proto, opMap, layout, shift = 0, innerOpMap = opM
   const regXor = secureRandomFloat() * 65535 | 0;
   const chainSeed = 1 + (secureRandomFloat() * 65520 | 0);
   return { nparams: proto.numparams || 0, maxstack: Math.max(2, proto.maxstack || 2), consts, code, instructionMap, nested: nested ? 1 : 0, opcodeDecode,
-    regMul, regAdd, regXor, opShift: localShift, opShift2: localShift2, chainSeed, operandOrder, operandOrderBySemantic,
+    regMul, regAdd, regXor, opShift: localShift, opShift2: localShift2, chainSeed, opcodeSalt, operandOrder, operandOrderBySemantic,
     upvals: (proto.upvals || []).map(u => [u.inStack ? 1 : 0, u.idx]), protos,
+    wordProfile, constProfile, constVariant:(secureRandomFloat()*6|0),
     // Internal-only validation metadata; emitVmProtoNumeric serializes only its allowlisted fields.
     _validationOpMap: new Map(selectedOpMap), operandOrderBySemantic };
 }
@@ -2519,8 +2595,8 @@ function makeDigest(profile = chooseMetamorphicIntegrityProfile(), profile2 = nu
   const pm = v => ((Math.floor(Number(v)) % INTEGRITY_MOD) + INTEGRITY_MOD) % INTEGRITY_MOD;
   return {
     profile, profile2,
-    add(v) { const n = pm(v); acc = (acc * mul + n + add) % INTEGRITY_MOD; acc2 = (acc2 * mul2 + n + add2) % INTEGRITY_MOD; },
-    byte(b) { const n = b & 255; acc = (acc * mul + n + add) % INTEGRITY_MOD; acc2 = (acc2 * mul2 + n + add2) % INTEGRITY_MOD; },
+    add(v) { const n = pm(v); acc = (acc * mul + n + (acc % 251) * (n % 251) + add) % INTEGRITY_MOD; acc2 = (acc2 * mul2 + n + (acc2 % 251) * (n % 251) + add2) % INTEGRITY_MOD; },
+    byte(b) { const n = b & 255; acc = (acc * mul + n + (acc % 251) * n + add) % INTEGRITY_MOD; acc2 = (acc2 * mul2 + n + (acc2 % 251) * n + add2) % INTEGRITY_MOD; },
     value() { return acc; },
     value2() { return acc2; }
   };
@@ -2546,8 +2622,10 @@ function emitNumericConstExpr(value) {
 
 function emitConstTable(consts, mask, dig, nested = false, nestedKeyMask = 0xA7, xorProfile = null) {
   return "{" + consts.map((c, idx) => {
-    if (typeof c === "number") { dig.add(c); return emitNumericConstExpr(c); }
-    if (typeof c === "boolean") { dig.add(c ? 1 : 2); return c ? "true" : "false"; }
+    // Typed, length-delimited records prevent ambiguous concatenations in the
+    // integrity stream. This is corruption/tamper detection, not a secret MAC.
+    if (typeof c === "number") { dig.add(11); dig.add(1); dig.add(c); return emitNumericConstExpr(c); }
+    if (typeof c === "boolean") { dig.add(12); dig.add(1); dig.add(c ? 1 : 2); return c ? "true" : "false"; }
     // String constants are stored as per-byte masked integers, not readable literals.
     const bytes = Array.from(new TextEncoder().encode(String(c)));
     // A different per-constant seed changes the byte mask for each emitted build.
@@ -2563,96 +2641,198 @@ function emitConstTable(consts, mask, dig, nested = false, nestedKeyMask = 0xA7,
     for (let f = 1; f < fragCount; f++) cuts.push(Math.floor(bytes.length * f / fragCount));
     cuts.push(bytes.length);
     const frags = [];
+    dig.add(13); dig.add(bytes.length); dig.add(fragCount);
     const xp = xorProfile || { ka:31, kb:13, kc:17, kd:7, ke:5, kf:11, kg:7 };
     for (let fi = 0; fi < fragCount; fi++) {
       const off = cuts[fi], part = bytes.slice(cuts[fi], cuts[fi + 1]);
       const seed = (secureRandomFloat() * 251 | 0) + 1;
       const chain = (secureRandomFloat() * 251 | 0) + 1;
+      let previousCipher = (seed ^ chain ^ off ^ idx) & 255;
       const enc = part.map((b, j) => {
         const pos = off + j + 1;
         const key = (mask + idx * xp.ka + idx * idx * xp.kb + pos * xp.kc +
           ((pos * pos * xp.kd) % 256) + ((pos % xp.ke) * xp.kf) + seed * xp.kg +
           (((pos ^ (pos >>> 1)) * xp.ka) % 256)) & 255;
         const chainKey = (pos * 37 + chain * 13 + Math.floor(pos / 3) * 17 + (pos * pos * 7) % 256) & 255;
-        return (b ^ key ^ chainKey ^ (nested ? nestedKeyMask : 0)) & 255;
+        const cipher = (b ^ key ^ chainKey ^ previousCipher ^ (nested ? nestedKeyMask : 0)) & 255;
+        previousCipher = cipher;
+        return cipher;
       });
       frags.push({ off, enc, seed, chain, lua: "{__e=" + luaBufferExpr(enc) + ",__s=" + seed + ",__n=" + enc.length + ",__q=" + chain + ",__o=" + off + "}" });
     }
     for (let fi = frags.length - 1; fi > 0; fi--) { const j = secureRandomFloat() * (fi + 1) | 0; [frags[fi], frags[j]] = [frags[j], frags[fi]]; }
     for (const f of frags) { for (const b of f.enc) dig.byte(b); dig.add(f.seed); dig.add(f.enc.length); dig.add(f.chain); dig.add(f.off); }
-    dig.add(fragCount); dig.add(bytes.length);
     return "{__f={" + frags.map(f => f.lua).join(",") + "},__n=" + bytes.length + "}";
   }).join(",") + "}";
 }
 
 function emitProtoTable(p, mask, fields, dig, nestedPayloadMask = 0xA7A7A7A7, nestedKeyMask = 0xA7, xorProfile = null) {
   // Serialization is an explicit allowlist below; internal _validationOpMap is never read/emitted.
-  const serializedKeys = ["v","n","m","k","kt","kb","c","im","u","p","o","x","y","r1","r2","r3","q1","q2","cs","oo"];
+  const serializedKeys = ["v","n","m","k","kt","kb","c","im","imk","u","p","o","o2","meta","oo","wp","cp"];
   if (serializedKeys.includes("_validationOpMap")) throw new Error("Internal validation metadata cannot be serialized");
+  dig.add(501); // PROTO_BEGIN
   dig.add(p.nested ? 1 : 0); dig.add(p.nparams); dig.add(p.maxstack);
-  dig.add(p.regMul); dig.add(p.regAdd); dig.add(p.regXor); dig.add(p.opShift); dig.add(p.opShift2); dig.add(p.chainSeed);
+  dig.add(p.regMul); dig.add(p.regAdd); dig.add(p.regXor); dig.add(p.opShift); dig.add(p.opShift2); dig.add(p.chainSeed); dig.add(p.constVariant);
+  const wp = p.wordProfile || xorProfile;
+  const cp = p.constProfile || xorProfile;
+  const wordValues = [wp.a,wp.b,wp.c,wp.d,wp.e,wp.f,wp.g,wp.ca,wp.cb,wp.cc,wp.cd,wp.ce,wp.cf,wp.cg,wp.ch,wp.ci,wp.cj,wp.ck];
+  const constValues = [cp.ka,cp.kb,cp.kc,cp.kd,cp.ke,cp.kf,cp.kg];
+  dig.add(511); dig.add(wordValues.length); for (const v of wordValues) dig.add(v);
+  dig.add(512); dig.add(constValues.length); for (const v of constValues) dig.add(v);
+  dig.add(502); dig.add((p.consts || []).length); // CONSTANTS_BEGIN + count
   // Per-prototype opcode-map masking: emitted values are not direct handler slots.
   // This raises static extraction cost; it is obfuscation, not cryptographic secrecy.
   const mapKeyA = 1 + (secureRandomFloat() * 249 | 0);
   const mapKeyB = 1 + (secureRandomFloat() * 249 | 0);
-  const opcodePairs = Object.entries(p.opcodeDecode || {}).sort((a,b) => Number(a[0])-Number(b[0]));
-  // Dense positional dispatch vector: avoid readable `[opcode]=handler` pairs.
-  // Position is encoded opcode + 1; zero means an unused opcode slot.
-  const maskedOpcodeVector = new Array(251).fill(0);
-  for (const [encodedId, handlerSlot] of opcodePairs) {
-    const id = Number(encodedId), slot = Number(handlerSlot);
-    const maskedSlot = (slot + mapKeyA + (id * mapKeyB)) % 251;
-    maskedOpcodeVector[id] = maskedSlot;
-  }
-  for (let id = 0; id < maskedOpcodeVector.length; id++) {
-    dig.add(id); dig.add(maskedOpcodeVector[id]);
-  }
-  dig.add(mapKeyA); dig.add(mapKeyB);
+  // V7.3 sparse records are generated here so the build-time digest folds
+  // exactly the serialized bytes in the same order as the Luau integrity walker.
+  const opcodeBlobBytes = encodeOpcodeRecords(p, p.opcodeDecode || {}, mapKeyA, mapKeyB);
+  // V8.2: split each six-byte sparse opcode record stream into two independently emitted shares.
+  // The runtime recombines them only at the byte-read site; this is a layout
+  // diversification barrier, not encryption or a secret-key boundary.
+  const opcodeShareB = opcodeBlobBytes.map(() => (secureRandomFloat()*256)|0);
+  const opcodeShareA = opcodeBlobBytes.map((v,i) => (v ^ opcodeShareB[i]) & 255);
+  dig.add(503); dig.add(opcodeShareA.length);
+  for (let oi=0; oi<opcodeShareA.length; oi++) { dig.add(oi); dig.add(opcodeShareA[oi]); }
+  dig.add(513); dig.add(opcodeShareB.length);
+  for (let oi=0; oi<opcodeShareB.length; oi++) { dig.add(oi); dig.add(opcodeShareB[oi]); }
+  dig.add(mapKeyA); dig.add(mapKeyB); dig.add(p.opcodeSalt);
+  // Bind each physically permuted metadata group boundary exactly once.
+  dig.add(514); dig.add(4);
+  dig.add(1); dig.add(3);
+  dig.add(2); dig.add(6);
+  dig.add(3); dig.add(1);
+  dig.add(4); dig.add(1);
+  // V6: fixed-width operand metadata. Each physical handler owns six bytes:
+  // [operand-count, operand-1, ... operand-5]. Zero-filled slots are invalid
+  // opcodes and remain zero. This removes the directly readable Lua table map.
+  // Sparse two-part layout: 251-byte slot->row index followed by compact
+  // six-byte rows. This preserves O(1) runtime lookup without paying for
+  // 251 * 6 bytes in every prototype.
+  const operandOrderBytes = new Array(251).fill(0);
   const operandOrderRows = Object.entries(p.operandOrder || {}).sort((a,b)=>Number(a[0])-Number(b[0]));
-  dig.add(operandOrderRows.length);
-  const operandOrderLua = "{" + operandOrderRows.map(([slot, order]) => { dig.add(Number(slot)); dig.add(order.length); for (let oi=0;oi<order.length;oi++) { dig.add(oi); dig.add(order[oi]); } return "["+slot+"]={"+order.join("," )+"}"; }).join(",") + "}";
+  const operandOrderData = [];
+  for (let rowIndex = 0; rowIndex < operandOrderRows.length; rowIndex++) {
+    const [slotText, order] = operandOrderRows[rowIndex];
+    const slot = Number(slotText);
+    if (!Number.isInteger(slot) || slot < 1 || slot > 250 || !Array.isArray(order) || order.length > 5) {
+      throw new Error("Invalid packed operand map row: " + slotText);
+    }
+    if (operandOrderBytes[slot] !== 0) throw new Error("Duplicate physical operand slot: " + slot);
+    operandOrderBytes[slot] = rowIndex + 1;
+    const row = new Array(6).fill(0);
+    row[0] = order.length;
+    for (let oi = 0; oi < order.length; oi++) {
+      const fieldId = Number(order[oi]);
+      if (!Number.isInteger(fieldId) || fieldId < 1 || fieldId > 5) throw new Error("Invalid operand field id");
+      row[oi + 1] = fieldId;
+    }
+    operandOrderData.push(...row);
+  }
+  operandOrderBytes.push(...operandOrderData);
+  dig.add(504); dig.add(operandOrderBytes.length);
+  for (let oi = 0; oi < operandOrderBytes.length; oi++) { dig.add(oi); dig.add(operandOrderBytes[oi]); }
+  const operandOrderLua = '"' + operandOrderBytes.map(v => "\\" + String(v).padStart(3, "0")).join("") + '"';
   // Physical constant storage is shuffled independently from the logical indexes
   // referenced by bytecode. A per-prototype tree routes logical indexes to physical
-  // slots; strings remain lazily decoded and interned by __getK.
+  // slots; strings are decoded through rotating independent decoder pairs at each use site.
   const logicalConsts = p.consts || [];
   const constOrder = Array.from({length:logicalConsts.length},(_,i)=>i);
   for (let i=constOrder.length-1;i>0;i--) { const j=secureRandomFloat()*(i+1)|0; [constOrder[i],constOrder[j]]=[constOrder[j],constOrder[i]]; }
   const logicalToPhysical = new Array(constOrder.length);
   const physicalConsts = constOrder.map((logical, physical)=>{ logicalToPhysical[logical]=physical; return logicalConsts[logical]; });
-  const constArr = emitConstTable(physicalConsts, mask, dig, !!p.nested, nestedKeyMask, xorProfile);
+  const constArr = emitConstTable(physicalConsts, mask, dig, !!p.nested, nestedKeyMask, cp);
   const constBucketSize = 4 + (secureRandomFloat()*9|0);
   const constTreeRows = [];
+  const constTreeSeed = (p.chainSeed ^ p.regMul ^ (p.regAdd << 1) ^ (p.regXor >>> 1) ^ (p.opShift << 2) ^ p.opShift2) >>> 0;
   const constTreeRowCount = Math.ceil(logicalToPhysical.length/constBucketSize);
-  dig.add(constBucketSize); dig.add(constTreeRowCount);
+  dig.add(505); dig.add(constBucketSize); dig.add(constTreeRowCount); // CONSTANT_INDEX + dimensions
   for (let i=0,bi=0;i<logicalToPhysical.length;i+=constBucketSize,bi++) {
     const row=logicalToPhysical.slice(i,i+constBucketSize);
     dig.add(bi);
-    for (let j=0;j<row.length;j++) { dig.add(j); dig.add(row[j]); }
-    constTreeRows.push("{"+row.map(v=>emitNumericConstExpr(v)).join(",")+"}");
+    const encodedRow = row.map((physical, j) => {
+      const logicalIndex = i + j + 1;
+      const mask = (constTreeSeed ^ Math.imul(logicalIndex, 0x9E3779B1)) >>> 0;
+      const encoded = (physical ^ mask) >>> 0;
+      dig.add(j); dig.add(encoded);
+      return encoded;
+    });
+    constTreeRows.push("{"+encodedRow.map(v=>emitNumericConstExpr(v)).join(",")+"}");
   }
   const constTree = "{"+constTreeRows.join(",")+"}";
   const encodedBytes = [];
   let previousDecodedWord = p.chainSeed | 0;
   p.code.forEach((v, i) => {
     const decodedWord = Number(v) | 0;
-    let w = (decodedWord ^ vmWordMask(mask, i + 1, xorProfile)) >>> 0;
-    w = (w ^ vmChainWordMask(mask, i + 1, previousDecodedWord, p.chainSeed, xorProfile)) >>> 0;
+    let w = (decodedWord ^ vmWordMask(mask, i + 1, wp)) >>> 0;
+    w = (w ^ vmChainWordMask(mask, i + 1, previousDecodedWord, p.chainSeed, wp)) >>> 0;
     if (p.nested) w = (w ^ nestedPayloadMask) >>> 0;
     encodedBytes.push(w & 255, (w >>> 8) & 255, (w >>> 16) & 255, (w >>> 24) & 255);
     previousDecodedWord = decodedWord;
   });
+  dig.add(506); dig.add(encodedBytes.length); // BYTECODE + byte count
   for (const b of encodedBytes) dig.byte(b);
   const encodedCode = luaBufferExpr(encodedBytes);
   const instructionMap = p.instructionMap || [];
-  dig.add(instructionMap.length);
-  for (let i=0;i<instructionMap.length;i++) { dig.add(i); dig.add(instructionMap[i]); }
-  const instructionMapLua = "{" + instructionMap.map(v=>emitNumericConstExpr(v)).join(",") + "}";
+  const instructionMapSeed = (Math.floor(secureRandomFloat()*4294967295)>>>0) || 0x6D2B79F5;
+  let instructionMapState = instructionMapSeed >>> 0;
+  let instructionMapPreviousCipher = instructionMapSeed & 255;
+  let instructionMapPreviousOffset = 0;
+  const instructionMapBytes = [];
+  for (let mi=0; mi<instructionMap.length; mi++) {
+    const offset = Number(instructionMap[mi]);
+    const delta = offset - instructionMapPreviousOffset;
+    if (!Number.isInteger(delta) || delta <= 0 || delta > 0xFFFFFFFF) throw new Error("Invalid instruction-map delta");
+    instructionMapPreviousOffset = offset;
+    for (let bi=0; bi<4; bi++) {
+      instructionMapState = (instructionMapState ^ (instructionMapState << 13)) >>> 0;
+      instructionMapState = (instructionMapState ^ (instructionMapState >>> 17)) >>> 0;
+      instructionMapState = (instructionMapState ^ (instructionMapState << 5)) >>> 0;
+      const maskByte = (instructionMapState >>> ((bi & 3)*8)) & 255;
+      const plainByte = (delta >>> (bi*8)) & 255;
+      const cipherByte = (plainByte ^ maskByte ^ instructionMapPreviousCipher) & 255;
+      instructionMapBytes.push(cipherByte);
+      instructionMapPreviousCipher = cipherByte;
+    }
+  }
+  const instructionMapLua = '"' + instructionMapBytes.map(v=>"\\"+String(v).padStart(3,"0")).join("") + '"';
+  dig.add(507); dig.add(instructionMapBytes.length);
+  for (const b of instructionMapBytes) dig.byte(b);
+  dig.add(instructionMapSeed);
   const upvals = p.upvals || [];
+  dig.add(508); dig.add(upvals.length);
   for (const u of upvals) { dig.add(u[0]); dig.add(u[1]); }
   const upArr = "{" + upvals.map(u => "{" + u[0] + "," + u[1] + "}").join(",") + "}";
+  dig.add(509); dig.add((p.protos || []).length);
   const protoArr = p.protos.map(q => emitProtoTable(q, mask, fields, dig, nestedPayloadMask, nestedKeyMask, xorProfile)).join(",");
-  const opcodeArr = "{" + maskedOpcodeVector.map((v, i) => emitNumericConstExpr(v)).join(",") + "}";
-  return `{${fields.v}=${p.nested ? 1 : 0},${fields.n}=${p.nparams},${fields.m}=${p.maxstack},${fields.k}=${constArr},${fields.kt}=${constTree},${fields.kb}=${constBucketSize},${fields.c}=${encodedCode},${fields.im}=${instructionMapLua},${fields.u}=${upArr},${fields.p}={${protoArr}},${fields.o}=${opcodeArr},${fields.x}=${mapKeyA},${fields.y}=${mapKeyB},${fields.r1}=${p.regMul},${fields.r2}=${p.regAdd},${fields.r3}=${p.regXor},${fields.q1}=${p.opShift},${fields.q2}=${p.opShift2},${fields.cs}=${p.chainSeed},${fields.oo}=${operandOrderLua}}`;
+  dig.add(510); // PROTO_END
+  // Store the per-prototype decode vector as a byte string instead of a Lua
+  // numeric table. This is a representation change, not encryption: the VM
+  // still validates every byte and the payload digest covers the exact bytes.
+  // V8.2 sparse opcode records: each row contains a 32-bit encoded ID, slot, and check byte.
+  // physical handler slot. No 251-entry direct-index vector is emitted.
+  
+  // V6: coefficients are encoded as fixed-width byte strings rather than
+  // exposed as numeric Lua arrays. The decoder still necessarily contains the
+  // transforms; this reduces direct metadata extraction, not runtime recoverability.
+  const toProfileBytes = values => '"' + values.map(v => "\\" + String(v).padStart(3, "0")).join("") + '"';
+  const wordProfileLua = toProfileBytes(wordValues);
+  const constProfileLua = toProfileBytes(constValues);
+  const opcodeShareALua = '"' + opcodeShareA.map(v=>"\\"+String(v).padStart(3,"0")).join("") + '"';
+  const opcodeShareBLua = '"' + opcodeShareB.map(v=>"\\"+String(v).padStart(3,"0")).join("") + '"';
+  const logicalMetaGroups=[[mapKeyA,mapKeyB,p.opcodeSalt],[p.regMul,p.regAdd,p.regXor,p.opShift,p.opShift2,p.chainSeed],[p.constVariant],[instructionMapSeed]];
+  const physicalMetaGroups=new Array(4);
+  for(let logicalGroup=0;logicalGroup<4;logicalGroup++){
+    const groupValues=logicalMetaGroups[logicalGroup];
+    const physicalGroup=new Array(groupValues.length);
+    for(let logicalIndex=0;logicalIndex<groupValues.length;logicalIndex++){
+      const physicalIndex=fields.metaLayout.itemSlots[logicalGroup][logicalIndex]-1;
+      physicalGroup[physicalIndex]=groupValues[logicalIndex];
+    }
+    physicalMetaGroups[fields.metaLayout.groupSlots[logicalGroup]-1]=physicalGroup;
+  }
+  const metaLua='{'+physicalMetaGroups.map(group=>'{'+group.join(',')+'}').join(',')+'}';
+  return `{${fields.v}=${p.nested ? 1 : 0},${fields.n}=${p.nparams},${fields.m}=${p.maxstack},${fields.k}=${constArr},${fields.kt}=${constTree},${fields.kb}=${constBucketSize},${fields.c}=${encodedCode},${fields.im}=${instructionMapLua},${fields.u}=${upArr},${fields.p}={${protoArr}},${fields.o}=${opcodeShareALua},${fields.o2}=${opcodeShareBLua},${fields.meta}=${metaLua},${fields.oo}=${operandOrderLua},${fields.wp}=${wordProfileLua},${fields.cp}=${constProfileLua}}`;
 }
 
 /* INTEGRITY (upgrade 7): Lua walker that recomputes the digest over the payload at
@@ -2664,36 +2844,44 @@ function integrityWalkerLua(fields, wn, profile = { multiplier: 31, addend: 1 },
     const mul = String(profileForWalker.multiplier);
     const add = String(profileForWalker.addend);
     return `
-local ${name.fi}=function(acc,v)return (acc*${mul}+(math.floor(v)%${W})+${add})%${W} end
-local ${name.fb}=function(acc,buf)for j=0,buffer.len(buf)-1 do acc=(acc*${mul}+buffer.readu8(buf,j)+${add})%${W} end return acc end
+local ${name.fi}=function(acc,v)local n=math.floor(v)%${W};return (acc*${mul}+n+(acc%251)*(n%251)+${add})%${W} end
+local ${name.fb}=function(acc,buf)for j=0,buffer.len(buf)-1 do local n=buffer.readu8(buf,j);acc=(acc*${mul}+n+(acc%251)*n+${add})%${W} end return acc end
 local ${name.fp};${name.fp}=function(p,acc)
-acc=${name.fi}(acc,p.${fields.v}) acc=${name.fi}(acc,p.${fields.n}) acc=${name.fi}(acc,p.${fields.m})
-acc=${name.fi}(acc,p.${fields.r1}) acc=${name.fi}(acc,p.${fields.r2}) acc=${name.fi}(acc,p.${fields.r3}) acc=${name.fi}(acc,p.${fields.q1}) acc=${name.fi}(acc,p.${fields.q2}) acc=${name.fi}(acc,p.${fields.cs})
-local om=p.${fields.o};for i=1,#om do acc=${name.fi}(acc,i-1) acc=${name.fi}(acc,om[i]) end
-acc=${name.fi}(acc,p.${fields.x}) acc=${name.fi}(acc,p.${fields.y})
-local oo=p.${fields.oo} or {};local okeys={};for k in pairs(oo) do okeys[#okeys+1]=k end;table.sort(okeys);acc=${name.fi}(acc,#okeys);for oi=1,#okeys do local k=okeys[oi];acc=${name.fi}(acc,k);local row=oo[k];acc=${name.fi}(acc,#row);for j=1,#row do acc=${name.fi}(acc,j-1);acc=${name.fi}(acc,row[j]) end end
-local ks=p.${fields.k}
+acc=${name.fi}(acc,501) acc=${name.fi}(acc,p.${fields.v}) acc=${name.fi}(acc,p.${fields.n}) acc=${name.fi}(acc,p.${fields.m})
+acc=${name.fi}(acc,${fields.metaReadName}(p,2,1)) acc=${name.fi}(acc,${fields.metaReadName}(p,2,2)) acc=${name.fi}(acc,${fields.metaReadName}(p,2,3)) acc=${name.fi}(acc,${fields.metaReadName}(p,2,4)) acc=${name.fi}(acc,${fields.metaReadName}(p,2,5)) acc=${name.fi}(acc,${fields.metaReadName}(p,2,6)) acc=${name.fi}(acc,${fields.metaReadName}(p,3,1))
+local wp=p.${fields.wp};acc=${name.fi}(acc,511);acc=${name.fi}(acc,#wp);for i=1,#wp do acc=${name.fi}(acc,string.byte(wp,i)) end
+local cp=p.${fields.cp};acc=${name.fi}(acc,512);acc=${name.fi}(acc,#cp);for i=1,#cp do acc=${name.fi}(acc,string.byte(cp,i)) end
+local ks=p.${fields.k};acc=${name.fi}(acc,502);acc=${name.fi}(acc,#ks)
+local om=p.${fields.o};acc=${name.fi}(acc,503);acc=${name.fi}(acc,#om);for i=1,#om do acc=${name.fi}(acc,i-1) acc=${name.fi}(acc,string.byte(om,i)) end
+local om2=p.${fields.o2};acc=${name.fi}(acc,513);acc=${name.fi}(acc,#om2);for i=1,#om2 do acc=${name.fi}(acc,i-1) acc=${name.fi}(acc,string.byte(om2,i)) end
+acc=${name.fi}(acc,${fields.metaReadName}(p,1,1)) acc=${name.fi}(acc,${fields.metaReadName}(p,1,2)) acc=${name.fi}(acc,${fields.metaReadName}(p,1,3))
+acc=${name.fi}(acc,514);acc=${name.fi}(acc,4);for gi=1,4 do acc=${name.fi}(acc,gi);acc=${name.fi}(acc,#${fields.metaReadName}Group(p,gi)) end
+local oo=p.${fields.oo};acc=${name.fi}(acc,504);acc=${name.fi}(acc,#oo);for oi=1,#oo do acc=${name.fi}(acc,oi-1);acc=${name.fi}(acc,string.byte(oo,oi)) end
 for i=1,#ks do local v=ks[i]
 if type(v)=="table" and v.__f then
+acc=${name.fi}(acc,13);acc=${name.fi}(acc,v.__n);acc=${name.fi}(acc,#v.__f)
 for fi=1,#v.__f do local f=v.__f[fi];acc=${name.fb}(acc,f.__e) acc=${name.fi}(acc,f.__s) acc=${name.fi}(acc,f.__n) acc=${name.fi}(acc,f.__q) acc=${name.fi}(acc,f.__o) end
-acc=${name.fi}(acc,#v.__f) acc=${name.fi}(acc,v.__n)
-elseif type(v)=="table" then acc=${name.fb}(acc,v.__e) acc=${name.fi}(acc,v.__s) acc=${name.fi}(acc,v.__n) acc=${name.fi}(acc,v.__q)
-elseif type(v)=="boolean" then acc=${name.fi}(acc,v and 1 or 2)
-else acc=${name.fi}(acc,v) end
+elseif type(v)=="table" then acc=${name.fi}(acc,13);acc=${name.fi}(acc,v.__n);acc=${name.fi}(acc,1);acc=${name.fb}(acc,v.__e);acc=${name.fi}(acc,v.__s);acc=${name.fi}(acc,v.__n);acc=${name.fi}(acc,v.__q)
+elseif type(v)=="boolean" then acc=${name.fi}(acc,12);acc=${name.fi}(acc,1);acc=${name.fi}(acc,v and 1 or 2)
+else acc=${name.fi}(acc,11);acc=${name.fi}(acc,1);acc=${name.fi}(acc,v) end
 end
-acc=${name.fi}(acc,p.${fields.kb}) acc=${name.fi}(acc,#p.${fields.kt})
+acc=${name.fi}(acc,505);acc=${name.fi}(acc,p.${fields.kb}) acc=${name.fi}(acc,#p.${fields.kt})
 local kt=p.${fields.kt};for bi=1,#kt do acc=${name.fi}(acc,bi-1);for j=1,#kt[bi] do acc=${name.fi}(acc,j-1);acc=${name.fi}(acc,kt[bi][j]) end end
-acc=${name.fb}(acc,p.${fields.c})
-local im=p.${fields.im};acc=${name.fi}(acc,#im);for i=1,#im do acc=${name.fi}(acc,i-1);acc=${name.fi}(acc,im[i]) end
-local us=p.${fields.u}
+acc=${name.fi}(acc,506);acc=${name.fi}(acc,buffer.len(p.${fields.c}));acc=${name.fb}(acc,p.${fields.c})
+local im=p.${fields.im};acc=${name.fi}(acc,507);acc=${name.fi}(acc,#im);for i=1,#im do acc=${name.fi}(acc,string.byte(im,i)) end;acc=${name.fi}(acc,${fields.metaReadName}(p,4,1))
+local us=p.${fields.u};acc=${name.fi}(acc,508);acc=${name.fi}(acc,#us)
 for i=1,#us do acc=${name.fi}(acc,us[i][1]) acc=${name.fi}(acc,us[i][2]) end
-local ps=p.${fields.p}
+local ps=p.${fields.p};acc=${name.fi}(acc,509);acc=${name.fi}(acc,#ps)
 for i=1,#ps do acc=${name.fp}(ps[i],acc) end
+acc=${name.fi}(acc,510)
 return acc
 end;`;
   };
   const secondName = { fi: wn.fi + "2", fb: wn.fb + "2", fp: wn.fp + "2" };
-  return emitWalker(wn, profile) + emitWalker(secondName, profile2);
+  const groupSlots=fields.metaLayout.groupSlots;
+  const itemSlots=fields.metaLayout.itemSlots;
+  const metaAccessor=`local ${fields.metaGroupName}={${groupSlots.join(',')}};local ${fields.metaReadName}Index={${itemSlots.map(row=>'{'+row.join(',')+'}').join(',')}};local function ${fields.metaReadName}(p,g,i)local gi=${fields.metaGroupName}[g];local ii=${fields.metaReadName}Index[g] and ${fields.metaReadName}Index[g][i];if not gi or not ii then error("WSF_INTEGRITY_FAILED",0) end;local group=p.${fields.meta};return group[gi][ii] end;local function ${fields.metaReadName}Group(p,g)local gi=${fields.metaGroupName}[g];if not gi then error("WSF_INTEGRITY_FAILED",0) end;return p.${fields.meta}[gi] end;`;
+  return metaAccessor + emitWalker(wn, profile) + emitWalker(secondName, profile2);
 }
 
 /* Build a per-output binary decision tree from randomized opcode IDs. */
@@ -2749,7 +2937,7 @@ function buildVmDispatchTree(opMap, names, handlerMap = opMap) {
    shuffled state dispatch. The Luraph schema-30 scaffold is structural inspiration only; unverified opcode
    semantics and operand formats are not copied. */
 let __wsTimingNoiseBuild = false;
-function buildLuauVmEngine(mask, opMap, innerOpMap, handlerMap, fields, names, layout, innerLayout, maskExpr, vrMul, vrAdd, vrXor, opShift, nestedPayloadMask = 0xA7A7A7A7, nestedKeyMask = 0xA7, xorProfile = null, integrityFn = null, instructionBudget = 1000000, opShift2 = 0, runtimeBinding = false, maskBase = 1, runtimeEnvExpectedKey = 0, integrityPolicy = "diagnostic") {
+function buildLuauVmEngine(mask, opMap, innerOpMap, handlerMap, fields, names, layout, innerLayout, maskExpr, vrMul, vrAdd, vrXor, opShift, nestedPayloadMask = 0xA7A7A7A7, nestedKeyMask = 0xA7, xorProfile = null, integrityFn = null, instructionBudget = 1000000, opShift2 = 0, runtimeBinding = false, maskBase = 1, runtimeEnvExpectedKey = 0, integrityPolicy = "strict", antiHookMode = "strict") {
   // Per-build names prevent emitted VM internals from exposing stable, searchable
   // identifiers. This is obfuscation only, not a guarantee against reverse engineering.
   const makeVmLocal = () => "__" + Array.from(
@@ -2791,31 +2979,123 @@ function buildLuauVmEngine(mask, opMap, innerOpMap, handlerMap, fields, names, l
   const previousWordName = makeVmLocal();
   const nextWordName = makeVmLocal();
   const decodedCacheName = makeVmLocal();
+  const decodedCacheIndexName = makeVmLocal();
+  const opcodeResolverName = makeVmLocal();
+  const constDecoderNameA = makeVmLocal();
+  const constDecoderNameB = makeVmLocal();
+  const constDecoderNameC = makeVmLocal();
+  const constDecoderBankName = makeVmLocal();
+  const constDecoderBankSealName = makeVmLocal();
+  const constDecoderSealAName = makeVmLocal();
+  const constDecoderSealBName = makeVmLocal();
+  const constDecoderSealCName = makeVmLocal();
+  const constDecodeEpochName = makeVmLocal();
+  const constDispatcherNames = [makeVmLocal(), makeVmLocal(), makeVmLocal()];
+  const constTreeSeedName = makeVmLocal();
+  const constChainStateName = makeVmLocal();
   const wordCountName = makeVmLocal();
-  // Each build chooses an equivalent opcode-unrotation formula and an independent
-  // reversible dispatch multiplier. These alter generated arithmetic, not semantics.
-  const opWordExpr = `D(pc+(__il and ${innerLayout.indexOf(0)} or ${layout.indexOf(0)}))`;
-  const opDecodeForms = [
-    `(${opWordExpr}-P.${fields.q1}-P.${fields.q2})%251`,
-    `(${opWordExpr}+502-P.${fields.q1}-P.${fields.q2})%251`,
-    `(((${opWordExpr}-P.${fields.q1})%251-P.${fields.q2})%251+251)%251`,
-    `(${opWordExpr}-((P.${fields.q1}+P.${fields.q2})%251)+251)%251`
-  ];
-  const opDecodeForm = opDecodeForms[secureRandomFloat() * opDecodeForms.length | 0];
+  const instructionMapReaderName = makeVmLocal();
+  // The instruction word is normalized as an unsigned 32-bit opcode ID before the sparse resolver.
+  const operandRowsBySlot = new Map(VM_OP_LIST.map(semantic => ({ semantic, slot: handlerMap.get(semantic) }))
+    .sort((a, b) => a.slot - b.slot).map((item, index) => [item.slot, index + 1]));
   const operandDecode = VM_OP_LIST.map((semantic, index) => {
     const slot = handlerMap.get(semantic);
+    const rowIndex = operandRowsBySlot.get(slot);
     const schema = VM_OPERAND_SCHEMAS[semantic] || [];
-    const reads = schema.length ? `local __oo=P.${fields.oo} and P.${fields.oo}[${slot}];if type(__oo)~="table" or #__oo~=${schema.length} then error("Invalid operand order",0) end;for __oi=1,#__oo do local __ov=D(__oprd);__oprd=__oprd+1;local __of=__oo[__oi];if __of==1 then a=__ov elseif __of==2 then b=__ov elseif __of==3 then c=__ov elseif __of==4 then bx=__ov elseif __of==5 then sbx=__ov else error("Invalid operand field",0) end end` : "";
+    const operandBase = 251 + (rowIndex - 1) * 6 + 1;
+    const operandLookup = slot + 1;
+    const reads = schema.length ? `local __ooRow=__WSAT_byte(P.${fields.oo},${operandLookup});if __ooRow~=${rowIndex} then error("Invalid operand map index",0) end;local __ooBase=${operandBase};local __ooCount=__WSAT_byte(P.${fields.oo},__ooBase);if __ooCount~=${schema.length} then error("Invalid operand order",0) end;for __oi=1,__ooCount do local __ov=D(__oprd);__oprd=__oprd+1;local __of=__WSAT_byte(P.${fields.oo},__ooBase+__oi);if __of==1 then a=__ov elseif __of==2 then b=__ov elseif __of==3 then c=__ov elseif __of==4 then bx=__ov elseif __of==5 then sbx=__ov else error("Invalid operand field",0) end end` : `if __WSAT_byte(P.${fields.oo},${operandLookup})~=${rowIndex} then error("Invalid operand map index",0) end`;
     return (index ? "elseif" : "if") + ` op==${slot} then ${reads || "do end"} `;
   }).join("") + "end";
-  const dispatchMultiplier = 1 + (secureRandomFloat() * 250 | 0);
+  const dispatchMultiplier = 1 + (secureKeyFloat() * 250 | 0);
   let dispatchInverse = 1;
   while ((dispatchMultiplier * dispatchInverse) % 251 !== 1) dispatchInverse++;
-  const dispatchLastMul = 1 + (secureRandomFloat() * 250 | 0);
-  const dispatchStackMul = 1 + (secureRandomFloat() * 250 | 0);
-  const flowPcMul = 1 + (secureRandomFloat() * 250 | 0);
-  const flowLastMul = 1 + (secureRandomFloat() * 250 | 0);
-  const flowStackMul = 1 + (secureRandomFloat() * 250 | 0);
+  const dispatchLastMul = 1 + (secureKeyFloat() * 250 | 0);
+  const dispatchStackMul = 1 + (secureKeyFloat() * 250 | 0);
+  const flowPcMul = 1 + (secureKeyFloat() * 250 | 0);
+  const flowLastMul = 1 + (secureKeyFloat() * 250 | 0);
+  const flowStackMul = 1 + (secureKeyFloat() * 250 | 0);
+  const constChainForms = [
+    `(pos*37+${constChainStateName}*13+__WSAT_floor(pos/3)*17+(pos*pos*7)%256)%256`,
+    `((pos*37)%256+(${constChainStateName}*13)%256+(__WSAT_floor(pos/3)*17)%256+((pos%256)*(pos%256)*7)%256)%256`,
+    `(pos*37+${constChainStateName}*13+__WSAT_floor(pos/3)*17+((pos%256)*(pos%256)*7))%256`
+  ];
+  const constQForms = [
+    `(__XM+physical*__WSAT_byte(__constProfile,1)+physical*physical*__WSAT_byte(__constProfile,2)+pos*__WSAT_byte(__constProfile,3)+(pos*pos*__WSAT_byte(__constProfile,4))%256+((pos%__WSAT_byte(__constProfile,5))*__WSAT_byte(__constProfile,6))+seed*__WSAT_byte(__constProfile,7)+((__WSAT_bxor(pos,bit32.rshift(pos,1))*__WSAT_byte(__constProfile,1))%256))%256`,
+    `(__XM+seed*__WSAT_byte(__constProfile,7)+((pos%__WSAT_byte(__constProfile,5))*__WSAT_byte(__constProfile,6))+physical*__WSAT_byte(__constProfile,1)+(physical*physical*__WSAT_byte(__constProfile,2))%256+pos*__WSAT_byte(__constProfile,3)+(pos*pos*__WSAT_byte(__constProfile,4))%256+((__WSAT_bxor(pos,bit32.rshift(pos,1))*__WSAT_byte(__constProfile,1))%256))%256`,
+    `(__XM+(physical*__WSAT_byte(__constProfile,1))%256+(physical*physical*__WSAT_byte(__constProfile,2))%256+(pos*__WSAT_byte(__constProfile,3))%256+(pos*pos*__WSAT_byte(__constProfile,4))%256+((pos%__WSAT_byte(__constProfile,5))*__WSAT_byte(__constProfile,6))%256+(seed*__WSAT_byte(__constProfile,7))%256+((__WSAT_bxor(pos,bit32.rshift(pos,1))*__WSAT_byte(__constProfile,1))%256))%256`
+  ];
+  const buildConstDecoder = (decoderName, variant) => `local function ${decoderName}(i)
+${integrityFn ? " __WSIntegrityAssert();" : ""}
+ if __WSAT_type(i)~="number" or i%1~=0 or i<0 or i>=#P.${fields.k} then __WSAT_error(${luaHiddenString("WSF_DIAG_CONSTANT_BOUNDS")},0) end
+ local bucket=P.${fields.kt}[__WSAT_floor(i/P.${fields.kb})+1];if __WSAT_type(bucket)~="table" then __WSAT_error("Invalid constant bucket",0) end
+ local __logical=i+1;local __treeMask=bit32.bxor(${constTreeSeedName},(__logical*2654435761)%4294967296)
+ local physical=bit32.bxor(bucket[(i%P.${fields.kb})+1],__treeMask)
+ if __WSAT_type(physical)~="number" or physical%1~=0 or physical<0 or physical>=#P.${fields.k} then __WSAT_error("Invalid constant tree index",0) end
+ local v=P.${fields.k}[physical+1]
+ if __WSAT_type(v)=="table" and v.__f then
+  local n=v.__n or 0;local out=__WSAT_buf_create(n)
+  for fi=1,#v.__f do
+   local f=v.__f[fi];local seed=f.__s or 0;local ${constChainStateName}=f.__q or 0;local off=f.__o or 0;local previousCipher=bit32.band(bit32.bxor(seed,${constChainStateName},off,physical),255)
+   for j=1,f.__n do
+    local pos=off+j;local cipher=__WSAT_buf_readu8(f.__e,j-1)
+    local chainKey=${constChainForms[variant]}
+    local q=${constQForms[variant]}
+    local z=__WSAT_bxor(cipher,chainKey,q,previousCipher);previousCipher=cipher
+    if P.${fields.v}==1 then z=__WSAT_bxor(z,${nestedKeyMask}) end
+    __WSAT_buf_writeu8(out,pos-1,z)
+   end
+  end
+  local decoded=__WSAT_buf_tostring(out);__WSAT_buf_fill(out,0,0,n);out=nil;return decoded
+ end
+ if __WSAT_type(v)=="table" and v.__e then
+  local seed=v.__s or 0;local ${constChainStateName}=v.__q or 0;local n=v.__n or __WSAT_buf_len(v.__e);local out=__WSAT_buf_create(n);local previousCipher=bit32.band(bit32.bxor(seed,${constChainStateName},physical),255)
+  for j=1,n do
+   local pos=j;local cipher=__WSAT_buf_readu8(v.__e,j-1)
+   local chainKey=${constChainForms[variant]}
+   local q=${constQForms[variant]}
+   local z=__WSAT_bxor(cipher,chainKey,q,previousCipher);previousCipher=cipher
+   if P.${fields.v}==1 then z=__WSAT_bxor(z,${nestedKeyMask}) end
+   __WSAT_buf_writeu8(out,j-1,z)
+  end
+  local decoded=__WSAT_buf_tostring(out);__WSAT_buf_fill(out,0,0,n);out=nil;return decoded
+ end
+ if __WSAT_type(v)=="table" then __WSAT_error("Invalid constant record",0) end
+ return v
+end`;
+  const constDecoderBlock = [
+    `local ${constTreeSeedName}=bit32.bxor(${fields.metaReadName}(P,2,6),${fields.metaReadName}(P,2,1),bit32.lshift(${fields.metaReadName}(P,2,2),1),bit32.rshift(${fields.metaReadName}(P,2,3),1),bit32.lshift(${fields.metaReadName}(P,2,4),2),${fields.metaReadName}(P,2,5))`,
+    buildConstDecoder(constDecoderNameA, 0),
+    buildConstDecoder(constDecoderNameB, 1),
+    buildConstDecoder(constDecoderNameC, 2),
+    `local __decoderPermutations={{1,2,3},{1,3,2},{2,1,3},{2,3,1},{3,1,2},{3,2,1}};local __decoderRaw={${constDecoderNameA},${constDecoderNameB},${constDecoderNameC}};local __decoderOrder=__decoderPermutations[(${fields.metaReadName}(P,3,1)%6)+1];local ${constDecoderBankName}={__decoderRaw[__decoderOrder[1]],__decoderRaw[__decoderOrder[2]],__decoderRaw[__decoderOrder[3]]};local ${constDecoderSealAName}=${constDecoderBankName}[1];local ${constDecoderSealBName}=${constDecoderBankName}[2];local ${constDecoderSealCName}=${constDecoderBankName}[3];local ${constDecoderBankSealName}=${constDecoderBankName};local ${constDecodeEpochName}=0;__WSATRegisterCoreTable(${constDecoderBankName})`,
+    `local ${constDispatcherNames[0]}=function(i)local a=${constDecoderBankName}[1](i);local b=${constDecoderBankName}[2](i);if not __WSAT_rawequal(a,b) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;return a end`,
+    `local ${constDispatcherNames[1]}=function(i)local a=${constDecoderBankName}[2](i);local b=${constDecoderBankName}[3](i);if not __WSAT_rawequal(a,b) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;return a end`,
+    `local ${constDispatcherNames[2]}=function(i)local a=${constDecoderBankName}[3](i);local b=${constDecoderBankName}[1](i);if not __WSAT_rawequal(a,b) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;return a end`,
+    `local __constDispatchSealA=${constDispatcherNames[0]};local __constDispatchSealB=${constDispatcherNames[1]};local __constDispatchSealC=${constDispatcherNames[2]};local __constRouteSalt=${1 + (secureKeyFloat()*65521|0)};local function __constDispatchRoute(i,lane)local r=(i*17+lane*29+__constRouteSalt)%3;if r==0 then return ${constDispatcherNames[0]}(i) elseif r==1 then return ${constDispatcherNames[1]}(i) else return ${constDispatcherNames[2]}(i) end end`,
+    `if __WSAT_freeze then __WSAT_pcall(__WSAT_freeze,${constDecoderBankName}) end`
+  ].join("\n");
+  // Inline the comparison at each constant-use site. There is deliberately no
+  // shared __getK/constant-resolver function for hookfunction-style replacement.
+  const constResolveInline = (indexExpr) => `(function(i)
+ ${constDecodeEpochName}=${constDecodeEpochName}+1
+ if not __WSAT_rawequal(${constDecoderBankName},${constDecoderBankSealName}) or not __WSAT_rawequal(${constDecoderBankName}[1],${constDecoderSealAName}) or not __WSAT_rawequal(${constDecoderBankName}[2],${constDecoderSealBName}) or not __WSAT_rawequal(${constDecoderBankName}[3],${constDecoderSealCName}) or not __WSAT_rawequal(${constDispatcherNames[0]},__constDispatchSealA) or not __WSAT_rawequal(${constDispatcherNames[1]},__constDispatchSealB) or not __WSAT_rawequal(${constDispatcherNames[2]},__constDispatchSealC) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ local lane=(${constDecodeEpochName}+i)%3+1;local value=__constDispatchRoute(i,lane)
+ if ${constDecodeEpochName}%11==0 then local a=${constDispatcherNames[0]}(i);local b=${constDispatcherNames[1]}(i);local c=${constDispatcherNames[2]}(i);if not __WSAT_rawequal(a,b) or not __WSAT_rawequal(a,c) or not __WSAT_rawequal(a,value) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end end
+ return value
+end)(${indexExpr})`
+  const antiHookProbeKey = "p" + Array.from({length:12}, () => "abcdefghijklmnopqrstuvwxyz0123456789"[Math.floor(secureRandomFloat()*36)]).join("");
+  const antiHookGuardLua = antiHookMode === "off" ? "return true" : [
+    'if __WSAT_type(__WSAT_rawget)~="function" or __WSAT_type(__WSAT_rawset)~="function" or __WSAT_type(__WSAT_getmetatable)~="function" then __WSAT_error("WSF_INTEGRITY_FAILED",0) end',
+    ...(antiHookMode === "strict" ? [
+      'if (debug~=nil)~=__WSAT_debugPresentAtBootstrap or debug~=__WSAT_debug or xpcall~=__WSAT_xpcall or getfenv~=__WSAT_getfenv or setfenv~=__WSAT_setfenv or hookfunction~=nil or hookmetamethod~=nil or newcclosure~=nil or clonefunction~=nil or restorefunction~=nil or getgenv~=nil or getrenv~=nil or getgc~=nil or getreg~=nil or getconnections~=nil or getloadedmodules~=nil or getnilinstances~=nil or getinstances~=nil or checkcaller~=nil or isexecutorclosure~=nil then __WSAT_error("WSF_INTEGRITY_FAILED",0) end',
+      'if __WSAT_debug and __WSAT_type(__WSAT_debug)=="table" then local denied={"getupvalue","setupvalue","getregistry","getlocal","setlocal","sethook","gethook","getinfo","upvalueid","upvaluejoin"};for i=1,#denied do local fn=__WSAT_rawget(__WSAT_debug,denied[i]);if fn~=nil then __WSAT_error("WSF_INTEGRITY_FAILED",0) end end end'
+    ] : []),
+    `local probe={};local key="${antiHookProbeKey}";__WSAT_rawset(probe,key,0x5A);if __WSAT_rawget(probe,key)~=0x5A or __WSAT_getmetatable(probe)~=nil then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;local mt={};__WSAT_setmetatable(probe,mt);if __WSAT_getmetatable(probe)~=mt then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;__WSAT_setmetatable(probe,nil);probe[key]=nil`,
+    'local currentThread;if __WSAT_coroutineRunning then currentThread=__WSAT_coroutineRunning() end;if currentThread==nil then currentThread=__WSATMainThreadToken end;if expectedThread==nil or not __WSAT_rawequal(currentThread,expectedThread) or not __WSAT_rawequal(__WSATMainThreadToken,__WSATMainThreadTokenSeal) then __WSAT_error("WSF_INTEGRITY_FAILED",0) end',
+    'if __WSATCoreTableNext<1 then __WSAT_error("WSF_INTEGRITY_FAILED",0) end;for ri=1,__WSATCoreTableNext do local t=__WSAT_rawget(__WSATCoreTableRegistry,ri);if __WSAT_type(t)~="table" or __WSAT_getmetatable(t)~=nil then __WSAT_error("WSF_INTEGRITY_FAILED",0) end end',
+    'return true'
+  ].join("\n");
   let engine = `
 ${envKeyCode}
 local __XM=${runtimeMaskExpr}
@@ -2832,27 +3112,51 @@ local __rootIntegrity=nil;local __integrityTick=0
 -- Runtime consistency telemetry (not a cryptographic anti-tamper boundary).
 -- The primary and shadow rings are kept separately so accidental single-ring
 -- corruption can be detected; an attacker controlling this VM can still alter both.
-local __WSIntegrityRing={0,0,0,0,0,0,0,0};local __WSIntegrityShadowRing={0,0,0,0,0,0,0,0}
--- Seed the rolling checks with the exact folds of the eight zeroed slots.
+local __WSIntegrityRing={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};local __WSIntegrityShadowRing={0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}
+-- Seed the rolling checks with the exact folds of the thirty-two zeroed slots.
 -- Leaving the old 0/1 placeholders here made the very first assertion fail
 -- before the VM executed its first instruction (WSF_DIAG_INTEGRITY_DATA_PATH).
-local __WSIntegrityCursor=1;local __WSIntegrityFold=46974;local __WSIntegrityAlt=4141
-local __WSIntegrityShadowFold=41232;local __WSIntegrityShadowAlt=20889
-local __WSAT_type,__WSAT_tostring,__WSAT_error,__WSAT_pcall=type,tostring,error,pcall
-local __WSAT_math,__WSAT_floor,__WSAT_string,__WSAT_byte=math,math and math.floor,string,string and string.byte
+local __WSIntegrityCursor=1;local __WSIntegrityFold=48880;local __WSIntegrityAlt=50789
+local __WSIntegrityShadowFold=14989;local __WSIntegrityShadowAlt=36489
+local __WSAT_type,__WSAT_tostring,__WSAT_error,__WSAT_pcall,__WSAT_rawequal=type,tostring,error,pcall,rawequal
+local __WSAT_table=table;local __WSAT_freeze=table and table.freeze
+local __WSAT_math,__WSAT_floor,__WSAT_ceil,__WSAT_abs,__WSAT_sqrt,__WSAT_min,__WSAT_max,__WSAT_string,__WSAT_byte=math,math and math.floor,math and math.ceil,math and math.abs,math and math.sqrt,math and math.min,math and math.max,string,string and string.byte
 local __WSAT_bit32=__bit
 local __WSAT_bxor=__bit and __bit.bxor
+local __WSAT_rawget,__WSAT_rawset=rawget,rawset
+local __WSAT_getmetatable,__WSAT_setmetatable=getmetatable,setmetatable
+local __WSAT_coroutine=coroutine
+local __WSAT_coroutineRunning=coroutine and coroutine.running
+local __WSATMainThreadToken=function() end;local __WSATMainThreadTokenSeal=__WSATMainThreadToken
+local __WSAT_pairs=pairs
+local __WSAT_task=task
+local __WSAT_taskSpawn=task and task.spawn
+local __WSAT_debug=debug
+local __WSAT_debugPresentAtBootstrap=(debug~=nil)
+local __WSAT_xpcall=xpcall
+local __WSAT_getfenv,__WSAT_setfenv=getfenv,setfenv
+local __WSATCoreTableRegistry={}
+local __WSATCoreTableNext=0
+local function __WSATRegisterCoreTable(value)
+ if __WSAT_type(value)~="table" then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ __WSATCoreTableNext=__WSATCoreTableNext+1
+ __WSATCoreTableRegistry[__WSATCoreTableNext]=value
+end
+local function __WSATReflectionGuard(expectedThread)
+ ${antiHookGuardLua}
+end
 -- Capture the buffer API once. Critical decoding paths use these locals instead
 -- of repeatedly resolving mutable global table fields.
-local __WSAT_buffer=buffer
-local __WSAT_buf_create=buffer and buffer.create
-local __WSAT_buf_len=buffer and buffer.len
-local __WSAT_buf_readu8=buffer and buffer.readu8
-local __WSAT_buf_writeu8=buffer and buffer.writeu8
-local __WSAT_buf_readu32=buffer and buffer.readu32
-local __WSAT_buf_tostring=buffer and buffer.tostring
-local __WSAT_buf_fill=buffer and buffer.fill
-local function __WSATCheck()
+local __WSAT_buffer=__buf
+local __WSAT_buf_create=__buf and __buf.create
+local __WSAT_buf_len=__buf and __buf.len
+local __WSAT_buf_readu8=__buf and __buf.readu8
+local __WSAT_buf_writeu8=__buf and __buf.writeu8
+local __WSAT_buf_readu32=__buf and __buf.readu32
+local __WSAT_buf_tostring=__buf and __buf.tostring
+local __WSAT_buf_fill=__buf and __buf.fill
+local function __WSATCheck(expectedThread)
+ __WSATReflectionGuard(expectedThread)
  -- Check captured primitives and exercise a tiny buffer round-trip.
  -- This detects selected API breakage/replacement; it is not proof against
  -- an attacker who can rewrite this VM or its captured upvalues.
@@ -2869,53 +3173,75 @@ local function __WSATCheck()
  if not ok or a~="number" or b~="1" or c~=1 or d~=65 or e~=6 or f~=65 or g~=1 or h~="A:0" then
   __WSAT_error("WSF_DIAG_RUNTIME_SANITY",0)
  end
-end
--- Fail closed. Policy is selected during code generation, not at runtime.
-local function __WSIntegrityFail(code)
- ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : '__WSAT_error(code,0)'}
-end
-local function __WSIntegrityAssert()
- if __WSAT_type(__WSIntegrityRing)~="table" or __WSAT_type(__WSIntegrityShadowRing)~="table"
-  or __WSAT_type(__WSIntegrityCursor)~="number" or __WSIntegrityCursor%1~=0
-  or __WSIntegrityCursor<1 or __WSIntegrityCursor>8
-  or __WSAT_type(__WSIntegrityFold)~="number" or __WSAT_type(__WSIntegrityAlt)~="number"
-  or __WSAT_type(__WSIntegrityShadowFold)~="number" or __WSAT_type(__WSIntegrityShadowAlt)~="number"
-  or __WSIntegrityFold%1~=0 or __WSIntegrityAlt%1~=0
-  or __WSIntegrityShadowFold%1~=0 or __WSIntegrityShadowAlt%1~=0 then
-  __WSIntegrityFail(${luaHiddenString("WSF_DIAG_INTEGRITY_STATE")})
- end
- local f,a,s,t=0,1,0,1
- for i=1,8 do
-  local x,y=__WSIntegrityRing[i],__WSIntegrityShadowRing[i]
-  if __WSAT_type(x)~="number" or __WSAT_type(y)~="number" or x%1~=0 or y%1~=0
-   or x<0 or x>=65521 or y<0 or y>=65521 then
-   __WSIntegrityFail(${luaHiddenString("WSF_DIAG_INTEGRITY_SLOT")})
-  end
-  f=(f*31+x+i*7)%65521
-  a=(a*17+__WSIntegrityRing[9-i]+i*13)%65521
-  s=(s*37+y+i*19)%65521
-  t=(t*23+__WSIntegrityShadowRing[9-i]+i*31)%65521
- end
- if f~=__WSIntegrityFold or a~=__WSIntegrityAlt or s~=__WSIntegrityShadowFold or t~=__WSIntegrityShadowAlt then
-  __WSIntegrityFail(${luaHiddenString("WSF_DIAG_INTEGRITY_DATA_PATH")})
+ local sentinel="WSF_PCALL_ERROR_SENTINEL";local threw,reason=__WSAT_pcall(function() __WSAT_error(sentinel,0) end)
+ if threw or reason~=sentinel then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ local xok,xvalue=__WSAT_xpcall(function() return 73 end,function(e) return e end)
+ if not xok or xvalue~=73 then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ -- Captured primitives remain usable if globals are replaced after bootstrap;
+ -- detect replacement and fail closed rather than silently trusting the new globals.
+ if type~=__WSAT_type or tostring~=__WSAT_tostring or pcall~=__WSAT_pcall or xpcall~=__WSAT_xpcall or error~=__WSAT_error or rawequal~=__WSAT_rawequal
+  or getfenv~=__WSAT_getfenv or setfenv~=__WSAT_setfenv or rawget~=__WSAT_rawget or rawset~=__WSAT_rawset or getmetatable~=__WSAT_getmetatable or setmetatable~=__WSAT_setmetatable
+  or (coroutine and coroutine.running)~=(__WSAT_coroutine and __WSAT_coroutine.running)
+  or task~=__WSAT_task or (task and task.spawn)~=__WSAT_taskSpawn or pairs~=__WSAT_pairs
+  or math.floor~=__WSAT_floor or math.ceil~=__WSAT_ceil or math.abs~=__WSAT_abs or math.sqrt~=__WSAT_sqrt or math.min~=__WSAT_min or math.max~=__WSAT_max or string.byte~=__WSAT_byte
+  or __buf.create~=__WSAT_buf_create or __buf.len~=__WSAT_buf_len
+  or __buf.readu8~=__WSAT_buf_readu8 or __buf.writeu8~=__WSAT_buf_writeu8
+  or __buf.tostring~=__WSAT_buf_tostring or __buf.fill~=__WSAT_buf_fill then
+  __WSAT_error("WSF_DIAG_RUNTIME_API_REPLACED",0)
  end
 end
+-- Integrity failures call the captured error primitive directly; no shared failure callback.
 -- MV_PRECHECK: deterministic runtime sanity checks. The emitted identifier is
 -- randomized per build; this checks runtime primitives and VM prototype shape,
 -- not the presence of debuggers or external tools.
-local function ${precheckName}(proto,frame)
- __WSATCheck()
- if __WSAT_type(proto)~="table" or __WSAT_type(proto.${fields.o})~="table" or __WSAT_type(proto.${fields.k})~="table" or __WSAT_type(proto.${fields.kt})~="table" or __WSAT_type(proto.${fields.kb})~="number" or __WSAT_type(proto.${fields.im})~="table" or __WSAT_type(proto.${fields.p})~="table" or __WSAT_type(proto.${fields.oo})~="table" then
+local ${instructionMapReaderName}_states={}
+local function ${instructionMapReaderName}(proto,index)
+ local blob=proto.${fields.im};local count=__WSAT_floor(#blob/4)
+ if __WSAT_type(index)~="number" or index%1~=0 or index<1 or index>count then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ local st=${instructionMapReaderName}_states[proto]
+ if not st then st={next=0,total=0,state=${fields.metaReadName}(proto,4,1),prev=bit32.band(${fields.metaReadName}(proto,4,1),255),cache={},ids={}};${instructionMapReaderName}_states[proto]=st end
+ local cacheSlot=((index-1)%8)+1
+ if st.ids[cacheSlot]==index then return st.cache[cacheSlot] end
+ if index<=st.next then st.next=0;st.total=0;st.state=${fields.metaReadName}(proto,4,1);st.prev=bit32.band(${fields.metaReadName}(proto,4,1),255);st.cache={};st.ids={} end
+ while st.next<index do
+  local entry=st.next+1;local delta=0
+  for bi=0,3 do st.state=bit32.bxor(st.state,bit32.lshift(st.state,13));st.state=bit32.bxor(st.state,bit32.rshift(st.state,17));st.state=bit32.bxor(st.state,bit32.lshift(st.state,5));local cipher=__WSAT_byte(blob,(entry-1)*4+bi+1);local maskByte=bit32.band(bit32.rshift(st.state,bi*8),255);local plain=bit32.bxor(cipher,maskByte,st.prev);st.prev=cipher;delta=delta+plain*(256^bi) end
+  st.total=st.total+delta;st.next=entry;local slot=((entry-1)%8)+1;st.cache[slot]=st.total;st.ids[slot]=entry
+ end
+ return st.cache[cacheSlot]
+end
+local function ${precheckName}(proto,frame,expectedThread)
+ __WSATCheck(expectedThread)
+ if __WSAT_type(proto)~="table" or __WSAT_type(proto.${fields.o})~="string" or __WSAT_type(proto.${fields.o2})~="string" or __WSAT_type(proto.${fields.k})~="table" or __WSAT_type(proto.${fields.kt})~="table" or __WSAT_type(proto.${fields.kb})~="number" or __WSAT_type(proto.${fields.im})~="string" or (#proto.${fields.im}%4)~=0 or __WSAT_type(proto.${fields.meta})~="table" or #proto.${fields.meta}~=4 or __WSAT_type(${fields.metaReadName}Group(proto,1))~="table" or #${fields.metaReadName}Group(proto,1)~=3 or __WSAT_type(${fields.metaReadName}Group(proto,2))~="table" or #${fields.metaReadName}Group(proto,2)~=6 or __WSAT_type(${fields.metaReadName}Group(proto,3))~="table" or #${fields.metaReadName}Group(proto,3)~=1 or __WSAT_type(${fields.metaReadName}Group(proto,4))~="table" or #${fields.metaReadName}Group(proto,4)~=1 or __WSAT_type(proto.${fields.p})~="table" or __WSAT_type(proto.${fields.oo})~="string" then
   __WSAT_error("WSF_DIAG_PROTO_SHAPE",0)
  end
- if #proto.${fields.o}~=251 or proto.${fields.kb}<1 or proto.${fields.kb}>64 or proto.${fields.kb}%1~=0 then
+ for __mg=1,4 do local __metaGroup=${fields.metaReadName}Group(proto,__mg);for __mi=1,#__metaGroup do local __mv=__metaGroup[__mi];if __WSAT_type(__mv)~="number" or __mv%1~=0 then __WSAT_error("WSF_INTEGRITY_FAILED",0) end end end
+ if #proto.${fields.o}~=${VM_OP_LIST.length*6} or #proto.${fields.o2}~=${VM_OP_LIST.length*6} or __WSAT_type(${fields.metaReadName}(proto,3,1))~="number" or ${fields.metaReadName}(proto,3,1)%1~=0 or ${fields.metaReadName}(proto,3,1)<0 or ${fields.metaReadName}(proto,3,1)>5 or proto.${fields.kb}<1 or proto.${fields.kb}>64 or proto.${fields.kb}%1~=0
+  or __WSAT_type(proto.${fields.m})~="number" or proto.${fields.m}%1~=0 or proto.${fields.m}<2
+  or __WSAT_type(proto.${fields.n})~="number" or proto.${fields.n}%1~=0 or proto.${fields.n}<0
+  or __WSAT_type(proto.${fields.wp})~="string" or #proto.${fields.wp}~=18
+  or __WSAT_type(proto.${fields.cp})~="string" or #proto.${fields.cp}~=7
+  or #proto.${fields.oo}~=(251+${VM_OP_LIST.length}*6) then
   __WSAT_error("WSF_DIAG_PROTO_LAYOUT",0)
  end
- for oi=1,#proto.${fields.o} do local slot=proto.${fields.o}[oi];if __WSAT_type(slot)~="number" or slot%1~=0 or slot<0 or slot>250 then __WSAT_error("WSF_DIAG_OPCODE_MAP",0) end end
- for key,row in pairs(proto.${fields.oo}) do
-  if __WSAT_type(key)~="number" or key%1~=0 or key<1 or key>250 or __WSAT_type(row)~="table" then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end
-  for ri=1,#row do local pos=row[ri];if __WSAT_type(pos)~="number" or pos%1~=0 or pos<1 or pos>5 then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end end
- end
+ for __pi=1,#proto.${fields.wp} do local __pv=__WSAT_byte(proto.${fields.wp},__pi);if __WSAT_type(__pv)~="number" or __pv<1 or __pv>250 then __WSAT_error("WSF_DIAG_KEY_PROFILE",0) end end
+ for __pi=1,#proto.${fields.cp} do local __pv=__WSAT_byte(proto.${fields.cp},__pi);if __WSAT_type(__pv)~="number" or __pv<1 or __pv>250 then __WSAT_error("WSF_DIAG_KEY_PROFILE",0) end end
+ local __operandRowCount=${VM_OP_LIST.length};local __operandSeen={}
+ for __slot=1,250 do local __row=__WSAT_byte(proto.${fields.oo},__slot+1);if __row<0 or __row>__operandRowCount then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end;if __row>0 then if __operandSeen[__row] then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end;__operandSeen[__row]=true end end
+ for __row=1,__operandRowCount do if not __operandSeen[__row] then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end;local __base=251+(__row-1)*6+1;local __count=__WSAT_byte(proto.${fields.oo},__base);if __count>5 then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end;for __ri=1,__count do local __pos=__WSAT_byte(proto.${fields.oo},__base+__ri);if __pos<1 or __pos>5 then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end end;for __ri=__count+1,5 do if __WSAT_byte(proto.${fields.oo},__base+__ri)~=0 then __WSAT_error("WSF_DIAG_OPERAND_MAP",0) end end end
+ local __seed=bit32.bxor(${fields.metaReadName}(proto,2,1),${fields.metaReadName}(proto,2,2),${fields.metaReadName}(proto,2,3),${fields.metaReadName}(proto,2,4),${fields.metaReadName}(proto,2,5),${fields.metaReadName}(proto,2,6),bit32.lshift(${fields.metaReadName}(proto,1,1),16),${fields.metaReadName}(proto,1,2),${fields.metaReadName}(proto,1,3))
+ for __si=1,#proto.${fields.wp} do local __v=__WSAT_byte(proto.${fields.wp},__si);__seed=bit32.bxor(__seed,__v,bit32.lshift(__v,7),bit32.rshift(__v,3));__seed=bit32.bxor(__seed,bit32.lshift(__seed,13));__seed=bit32.bxor(__seed,bit32.rshift(__seed,17));__seed=bit32.bxor(__seed,bit32.lshift(__seed,5)) end
+ for __si=1,#proto.${fields.cp} do local __v=__WSAT_byte(proto.${fields.cp},__si);__seed=bit32.bxor(__seed,__v,bit32.lshift(__v,7),bit32.rshift(__v,3));__seed=bit32.bxor(__seed,bit32.lshift(__seed,13));__seed=bit32.bxor(__seed,bit32.rshift(__seed,17));__seed=bit32.bxor(__seed,bit32.lshift(__seed,5)) end
+ if __seed==0 then __seed=0x6D2B79F5 end
+ local __prev=bit32.band(__seed,255);local __b0,__b1,__b2,__b3,__slot=0,0,0,0,0;local __seen={};local __record=0;local __prevCheck=bit32.band(__seed,255)
+ for __oi=1,#proto.${fields.o} do __seed=bit32.bxor(__seed,bit32.lshift(__seed,13));__seed=bit32.bxor(__seed,bit32.rshift(__seed,17));__seed=bit32.bxor(__seed,bit32.lshift(__seed,5));local __cipher=bit32.bxor(__WSAT_byte(proto.${fields.o},__oi),__WSAT_byte(proto.${fields.o2},__oi));local __mask=bit32.band(bit32.rshift(__seed,((__oi-1)%4)*8),255);local __plain=bit32.bxor(__cipher,__mask,__prev);__prev=__cipher;local __col=(__oi-1)%6;if __col==0 then __b0=__plain elseif __col==1 then __b1=__plain elseif __col==2 then __b2=__plain elseif __col==3 then __b3=__plain elseif __col==4 then __slot=__plain else __record=__record+1;local __id=__b0+__b1*256+__b2*65536+__b3*16777216;local __want=(__b0*3+__b1*5+__b2*7+__b3*11+__slot*13+__record*17+__prevCheck*19)%256;if __plain~=__want or __id<1 or __id>4294967295 or __slot<1 or __slot>250 or __seen[__id] then __WSAT_error("WSF_DIAG_OPCODE_MAP",0) end;__seen[__id]=true;__prevCheck=__plain end end
+ local __constCount=#proto.${fields.k};local __expectedBuckets=math.ceil(__constCount/proto.${fields.kb})
+ if #proto.${fields.kt}~=(__expectedBuckets) then __WSAT_error("WSF_DIAG_CONSTANT_INDEX",0) end
+ local __constSeen={}
+ local __treeSeed=bit32.bxor(${fields.metaReadName}(proto,2,6),${fields.metaReadName}(proto,2,1),bit32.lshift(${fields.metaReadName}(proto,2,2),1),bit32.rshift(${fields.metaReadName}(proto,2,3),1),bit32.lshift(${fields.metaReadName}(proto,2,4),2),${fields.metaReadName}(proto,2,5))
+ for __bi=1,#proto.${fields.kt} do local __row=proto.${fields.kt}[__bi];local __want=math.min(proto.${fields.kb},__constCount-(__bi-1)*proto.${fields.kb});if __WSAT_type(__row)~="table" or #__row~=__want then __WSAT_error("WSF_DIAG_CONSTANT_INDEX",0) end;for __ci=1,#__row do local __logical=(__bi-1)*proto.${fields.kb}+__ci;local __mask=bit32.bxor(__treeSeed,(__logical*2654435761)%4294967296);local __physical=bit32.bxor(__row[__ci],__mask);if __WSAT_type(__physical)~="number" or __physical%1~=0 or __physical<0 or __physical>=__constCount or __constSeen[__physical] then __WSAT_error("WSF_DIAG_CONSTANT_INDEX",0) end;__constSeen[__physical]=true end end
+ local __byteCount=__WSAT_buf_len(proto.${fields.c});if __byteCount%4~=0 or (#proto.${fields.im}/4)~=(__byteCount/4) then __WSAT_error("WSF_DIAG_BYTECODE_LENGTH",0) end;local __lastOffset=0
+ for __mi=1,(#proto.${fields.im}/4) do local __offset=${instructionMapReaderName}(proto,__mi);if __WSAT_type(__offset)~="number" or __offset%1~=0 or __offset<=__lastOffset or __offset<1 or __offset>__byteCount/4 then __WSAT_error("WSF_DIAG_INSTRUCTION_MAP",0) end;__lastOffset=__offset end
  if frame and (frame.proto~=proto or frame.state~="running" or frame.depth<1) then
   __WSAT_error("WSF_DIAG_FRAME_STATE",0)
  end
@@ -2951,86 +3277,104 @@ __WSV=function(P,__uv,...)
 local __entryMeta=__WSCurrentEntry;__WSCurrentEntry=nil
 __WSFrameSerial=__WSFrameSerial+1
 local __frameRecord={id=__WSFrameSerial,proto=P,pc=1,state="running",returnAddress=__entryMeta and __entryMeta.returnAddress or 0,returnDest=__entryMeta and __entryMeta.returnDest or 0,depth=#__WSFrameStack+1,transition=__entryMeta and __entryMeta.transition or 1}
+local __frameCoroutine=__WSAT_coroutineRunning and __WSAT_coroutineRunning() or __WSATMainThreadToken
+if __frameCoroutine==nil then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
 __WSFrameStack[#__WSFrameStack+1]=__frameRecord
+local function __WSIntegrityAssert()
+ if __WSAT_type(__WSIntegrityRing)~="table" or __WSAT_type(__WSIntegrityShadowRing)~="table"
+  or __WSAT_type(__WSIntegrityCursor)~="number" or __WSIntegrityCursor%1~=0
+  or __WSIntegrityCursor<1 or __WSIntegrityCursor>32
+  or __WSAT_type(__WSIntegrityFold)~="number" or __WSAT_type(__WSIntegrityAlt)~="number"
+  or __WSAT_type(__WSIntegrityShadowFold)~="number" or __WSAT_type(__WSIntegrityShadowAlt)~="number"
+  or __WSIntegrityFold%1~=0 or __WSIntegrityAlt%1~=0
+  or __WSIntegrityShadowFold%1~=0 or __WSIntegrityShadowAlt%1~=0 then
+  ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_INTEGRITY_STATE")},0)`}
+ end
+ local f,a,s,t=0,1,0,1
+ for i=1,32 do
+  local x,y=__WSIntegrityRing[i],__WSIntegrityShadowRing[i]
+  if __WSAT_type(x)~="number" or __WSAT_type(y)~="number" or x%1~=0 or y%1~=0
+   or x<0 or x>=65521 or y<0 or y>=65521 then
+   ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_INTEGRITY_SLOT")},0)`}
+  end
+  f=(f*31+x+i*7)%65521
+  a=(a*17+__WSIntegrityRing[33-i]+i*13)%65521
+  s=(s*37+y+i*19)%65521
+  t=(t*23+__WSIntegrityShadowRing[33-i]+i*31)%65521
+ end
+ if f~=__WSIntegrityFold or a~=__WSIntegrityAlt or s~=__WSIntegrityShadowFold or t~=__WSIntegrityShadowAlt then
+  ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_INTEGRITY_DATA_PATH")},0)`}
+ end
+end
+local __vmGuardEpoch=0
+local function __WSVMGuard()
+ __vmGuardEpoch=__vmGuardEpoch+1
+ local lane=__vmGuardEpoch%3
+ if lane==0 then __WSIntegrityAssert()
+ elseif lane==1 then __WSATCheck(__frameCoroutine)
+ else
+  if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack or __frameRecord.state~="running" then __WSAT_error("WSF_DIAG_VM_FRAME_GUARD",0) end
+ end
+end
 if not __rootIntegrity then __rootIntegrity=P end
-${integrityFn ? `${precheckName}(P,__frameRecord);if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack then error("WSF_DIAG_FRAME_STACK_ENTRY",0) end` : ""}
-local __VR,__vrmul,__vradd,__vrxor={},P.${fields.r1},P.${fields.r2},P.${fields.r3};local __rk={${Array.from({length:6},()=>1+(secureRandomFloat()*255|0)).join(',')}};local function __regkey(i)local l=math.floor(i/256)%256;local r=i%256;for q=1,6 do local k=__rk[q];local f=(r*r*3+r*k+q*17+k*k)%256;l,r=r,(l+f)%256 end;return l*256+r end;local R=setmetatable({},{__index=function(_,i)return __VR[__regkey(i)]end,__newindex=function(_,i,v)__VR[__regkey(i)]=v end});local U,pc,g,done,res=__uv or {},1,__vmenv,false,{}
-local S,sp,__fsp={},0,0;local __stackSalt=${(secureRandomFloat()*65520|0)}
+${integrityFn ? `${precheckName}(P,__frameRecord,__frameCoroutine);if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack then error("WSF_DIAG_FRAME_STACK_ENTRY",0) end` : ""}
+local __VR,__vrmul,__vradd,__vrxor={},${fields.metaReadName}(P,2,1),${fields.metaReadName}(P,2,2),${fields.metaReadName}(P,2,3);local __rk={${Array.from({length:6},()=>1+(secureKeyFloat()*255|0)).join(',')}};local function __regkey(i)local l=math.floor(i/256)%256;local r=i%256;for q=1,6 do local k=__rk[q];local f=(r*r*3+r*k+q*17+k*k)%256;l,r=r,(l+f)%256 end;return l*256+r end;local R=setmetatable({},{__index=function(_,i)return __VR[__regkey(i)]end,__newindex=function(_,i,v)__VR[__regkey(i)]=v end});local U,pc,g,done,res=__uv or {},1,__vmenv,false,{}
+local S,sp,__fsp={},0,0;local __stackSalt=${(secureKeyFloat()*65520|0)}
 local function __push(v) sp=sp+1;__fsp=(sp*37+__stackSalt)%65521;S[sp]={value=v,tag=bit32.bxor(sp,__stackSalt)} end
 local function __pop() local cell=S[sp];S[sp]=nil;sp=sp-1;__fsp=(sp*37+__stackSalt)%65521;return cell and cell.value end
 local args={...}
 local __NP=P.${fields.n}
 local __top=__NP
 for i=1,__NP do R[i-1]=args[i] end
-local ${decodedCacheName}={}
+local ${decodedCacheName},${decodedCacheIndexName}={},{}
 local ${nextWordName}=0
-local ${previousWordName}=P.${fields.cs} or 0
+local ${previousWordName}=${fields.metaReadName}(P,2,6) or 0
 local ${decodedCacheName}ount=__WSAT_floor(__WSAT_buf_len(P.${fields.c})/4)
+local __wordProfile=P.${fields.wp};local __constProfile=P.${fields.cp}
 local function ${chainKeyName}(i,previous,seed)
  local p0=bit32.band(previous,255);local p1=bit32.band(bit32.rshift(previous,8),255);local p2=bit32.band(bit32.rshift(previous,16),255);local p3=bit32.band(bit32.rshift(previous,24),255)
- local k0=(${maskExpr}+i*${xorProfile.ca}+(i*i*${xorProfile.cb})%256+seed*${xorProfile.cc}+p0*${xorProfile.cd}+p1*${xorProfile.ce}+p2*${xorProfile.cf}+p3*${xorProfile.cg}+1*${xorProfile.ch}+(i%${xorProfile.ci})*${xorProfile.cj}+((bit32.bxor(p1,p3)*${xorProfile.ck})%256))%256
- local k1=(${maskExpr}+i*${xorProfile.ca}+(i*i*${xorProfile.cb})%256+seed*${xorProfile.cc}+p0*${xorProfile.cd}+p1*${xorProfile.ce}+p2*${xorProfile.cf}+p3*${xorProfile.cg}+2*${xorProfile.ch}+(i%${xorProfile.ci})*${xorProfile.cj}+((bit32.bxor(p2,p0)*${xorProfile.ck})%256))%256
- local k2=(${maskExpr}+i*${xorProfile.ca}+(i*i*${xorProfile.cb})%256+seed*${xorProfile.cc}+p0*${xorProfile.cd}+p1*${xorProfile.ce}+p2*${xorProfile.cf}+p3*${xorProfile.cg}+3*${xorProfile.ch}+(i%${xorProfile.ci})*${xorProfile.cj}+((bit32.bxor(p3,p1)*${xorProfile.ck})%256))%256
- local k3=(${maskExpr}+i*${xorProfile.ca}+(i*i*${xorProfile.cb})%256+seed*${xorProfile.cc}+p0*${xorProfile.cd}+p1*${xorProfile.ce}+p2*${xorProfile.cf}+p3*${xorProfile.cg}+4*${xorProfile.ch}+(i%${xorProfile.ci})*${xorProfile.cj}+((bit32.bxor(p0,p2)*${xorProfile.ck})%256))%256
+ local k0=(${maskExpr}+i*__WSAT_byte(__wordProfile,8)+(i*i*__WSAT_byte(__wordProfile,9))%256+seed*__WSAT_byte(__wordProfile,10)+p0*__WSAT_byte(__wordProfile,11)+p1*__WSAT_byte(__wordProfile,12)+p2*__WSAT_byte(__wordProfile,13)+p3*__WSAT_byte(__wordProfile,14)+1*__WSAT_byte(__wordProfile,15)+(i%__WSAT_byte(__wordProfile,16))*__WSAT_byte(__wordProfile,17)+((bit32.bxor(p1,p3)*__WSAT_byte(__wordProfile,18))%256))%256
+ local k1=(${maskExpr}+i*__WSAT_byte(__wordProfile,8)+(i*i*__WSAT_byte(__wordProfile,9))%256+seed*__WSAT_byte(__wordProfile,10)+p0*__WSAT_byte(__wordProfile,11)+p1*__WSAT_byte(__wordProfile,12)+p2*__WSAT_byte(__wordProfile,13)+p3*__WSAT_byte(__wordProfile,14)+2*__WSAT_byte(__wordProfile,15)+(i%__WSAT_byte(__wordProfile,16))*__WSAT_byte(__wordProfile,17)+((bit32.bxor(p2,p0)*__WSAT_byte(__wordProfile,18))%256))%256
+ local k2=(${maskExpr}+i*__WSAT_byte(__wordProfile,8)+(i*i*__WSAT_byte(__wordProfile,9))%256+seed*__WSAT_byte(__wordProfile,10)+p0*__WSAT_byte(__wordProfile,11)+p1*__WSAT_byte(__wordProfile,12)+p2*__WSAT_byte(__wordProfile,13)+p3*__WSAT_byte(__wordProfile,14)+3*__WSAT_byte(__wordProfile,15)+(i%__WSAT_byte(__wordProfile,16))*__WSAT_byte(__wordProfile,17)+((bit32.bxor(p3,p1)*__WSAT_byte(__wordProfile,18))%256))%256
+ local k3=(${maskExpr}+i*__WSAT_byte(__wordProfile,8)+(i*i*__WSAT_byte(__wordProfile,9))%256+seed*__WSAT_byte(__wordProfile,10)+p0*__WSAT_byte(__wordProfile,11)+p1*__WSAT_byte(__wordProfile,12)+p2*__WSAT_byte(__wordProfile,13)+p3*__WSAT_byte(__wordProfile,14)+4*__WSAT_byte(__wordProfile,15)+(i%__WSAT_byte(__wordProfile,16))*__WSAT_byte(__wordProfile,17)+((bit32.bxor(p0,p2)*__WSAT_byte(__wordProfile,18))%256))%256
  return bit32.bor(k0,bit32.lshift(k1,8),bit32.lshift(k2,16),bit32.lshift(k3,24))
 end
 local function D(i)
  if __WSAT_type(i)~="number" or i%1~=0 or i<1 or i>${decodedCacheName}ount then __WSAT_error("Invalid bytecode word index",0) end
- local cached=${decodedCacheName}[i];if cached~=nil then return cached end
+ local __cacheSlot=((i-1)%8)+1
+ if ${decodedCacheIndexName}[__cacheSlot]==i then return ${decodedCacheName}[__cacheSlot] end
+ if i<=${nextWordName} then
+  for __ci=1,8 do ${decodedCacheName}[__ci]=nil;${decodedCacheIndexName}[__ci]=nil end
+  ${nextWordName}=0;${previousWordName}=${fields.metaReadName}(P,2,6) or 0
+ end
  while ${nextWordName}<i do
   local j=${nextWordName}+1
   local raw=__WSAT_buf_readu32(P.${fields.c},(j-1)*4)
   if P.${fields.v}==1 then raw=__WSAT_bxor(raw,${nestedPayloadMask}) end
-  local ${chainValueName}=${chainKeyName}(j,${previousWordName},P.${fields.cs} or 0)
-  local q=(__XM+j*${xorProfile.a}+(j*j*${xorProfile.b})%256+(__WSAT_floor(j/${xorProfile.d})*${xorProfile.c})%256+(j%${xorProfile.e})*${xorProfile.f}+((__WSAT_bxor(j,bit32.rshift(j,2))*${xorProfile.g})%256))%256
+  local ${chainValueName}=${chainKeyName}(j,${previousWordName},${fields.metaReadName}(P,2,6) or 0)
+  local q=(__XM+j*__WSAT_byte(__wordProfile,1)+(j*j*__WSAT_byte(__wordProfile,2))%256+(__WSAT_floor(j/__WSAT_byte(__wordProfile,4))*__WSAT_byte(__wordProfile,3))%256+(j%__WSAT_byte(__wordProfile,5))*__WSAT_byte(__wordProfile,6)+((__WSAT_bxor(j,bit32.rshift(j,2))*__WSAT_byte(__wordProfile,7))%256)+((__WSAT_bxor(${previousWordName},bit32.rshift(${previousWordName},13))*__WSAT_byte(__wordProfile,18))%256))%256
   local x=__WSAT_bxor(__WSAT_bxor(raw,${chainValueName}),q)
   local decoded=x;if decoded>2147483647 then decoded=decoded-4294967296 end
-  ${decodedCacheName}[j]=decoded;${previousWordName}=decoded;${nextWordName}=j
+  local __slot=((j-1)%8)+1;${decodedCacheName}[__slot]=decoded;${decodedCacheIndexName}[__slot]=j;${previousWordName}=decoded;${nextWordName}=j
  end
- return ${decodedCacheName}[i]
+ __cacheSlot=((i-1)%8)+1
+ if ${decodedCacheIndexName}[__cacheSlot]~=i then __WSAT_error("WSF_DIAG_WORD_CACHE",0) end
+ return ${decodedCacheName}[__cacheSlot]
 end
-local __KC={};local __KC_KEY=${(secureRandomFloat()*2147483646|0)+1}
-local function __kcMaskByte(j) return bit32.band(bit32.rshift(__KC_KEY,((j-1)%4)*8),255) end
-local function __kcUnmask(cached)
- local n=__WSAT_buf_len(cached);local out=__WSAT_buf_create(n)
- for j=1,n do __WSAT_buf_writeu8(out,j-1,__WSAT_bxor(__WSAT_buf_readu8(cached,j-1),__kcMaskByte(j))) end
- local decoded=__WSAT_buf_tostring(out);__WSAT_buf_fill(out,0,0,n);out=nil;return decoded
-end
-local function __getK(i)
-${integrityFn ? "__WSIntegrityAssert();" : ""}
-if __WSAT_type(i)~="number" or i%1~=0 or i<0 or i>=#P.${fields.k} then __WSAT_error(${luaHiddenString("WSF_DIAG_CONSTANT_BOUNDS")},0) end
-local cached=__KC[i];if cached~=nil then if __WSAT_type(cached)=="buffer" then return __kcUnmask(cached) end;return cached end
-local bucket=P.${fields.kt}[__WSAT_floor(i/P.${fields.kb})+1];if __WSAT_type(bucket)~="table" then __WSAT_error("Invalid constant bucket",0) end
-local physical=bucket[(i%P.${fields.kb})+1];if __WSAT_type(physical)~="number" or physical%1~=0 or physical<0 or physical>=#P.${fields.k} then __WSAT_error("Invalid constant tree index",0) end
-local v=P.${fields.k}[physical+1]
-if __WSAT_type(v)=="table" and v.__f then
- local n=v.__n or 0;local out=__WSAT_buf_create(n)
- for fi=1,#v.__f do local f=v.__f[fi];local seed=f.__s or 0;local ${chainValueName}=f.__q or 0;local off=f.__o or 0
-  for j=1,f.__n do local pos=off+j;local chainKey=(pos*37+${chainValueName}*13+__WSAT_floor(pos/3)*17+(pos*pos*7)%256)%256;local stage1=__WSAT_bxor(__WSAT_buf_readu8(f.__e,j-1),chainKey);local q=(__XM+physical*${xorProfile.ka}+physical*physical*${xorProfile.kb}+pos*${xorProfile.kc}+(pos*pos*${xorProfile.kd})%256+((pos%${xorProfile.ke})*${xorProfile.kf})+seed*${xorProfile.kg}+((__WSAT_bxor(pos,bit32.rshift(pos,1))*${xorProfile.ka})%256))%256;local z=__WSAT_bxor(stage1,q);if P.${fields.v}==1 then z=__WSAT_bxor(z,${nestedKeyMask}) end;__WSAT_buf_writeu8(out,pos-1,z) end
- end
- local decoded=__WSAT_buf_tostring(out);for j=1,n do __WSAT_buf_writeu8(out,j-1,__WSAT_bxor(__WSAT_buf_readu8(out,j-1),__kcMaskByte(j))) end;__KC[i]=out;out=nil;return decoded
-end
-if __WSAT_type(v)=="table" and v.__e then
- local seed=v.__s or 0;local ${chainValueName}=v.__q or 0;local n=v.__n or __WSAT_buf_len(v.__e);local out=__WSAT_buf_create(n)
- for j=1,n do local chainKey=(j*37+${chainValueName}*13+__WSAT_floor(j/3)*17+(j*j*7)%256)%256;local stage1=__WSAT_bxor(__WSAT_buf_readu8(v.__e,j-1),chainKey);local q=(__XM+physical*${xorProfile.ka}+physical*physical*${xorProfile.kb}+j*${xorProfile.kc}+(j*j*${xorProfile.kd})%256+((j%${xorProfile.ke})*${xorProfile.kf})+seed*${xorProfile.kg}+((__WSAT_bxor(j,bit32.rshift(j,1))*${xorProfile.ka})%256))%256;local z=__WSAT_bxor(stage1,q);if P.${fields.v}==1 then z=__WSAT_bxor(z,${nestedKeyMask}) end;__WSAT_buf_writeu8(out,j-1,z) end
- local decoded=__WSAT_buf_tostring(out);for j=1,n do __WSAT_buf_writeu8(out,j-1,__WSAT_bxor(__WSAT_buf_readu8(out,j-1),__kcMaskByte(j))) end;__KC[i]=out;out=nil;return decoded
-end
-if v~=nil and __WSAT_type(v)~="table" then __KC[i]=v;return v end
-__KC[i]=v;return v
-end
+${constDecoderBlock}
 local H={{},{},{},{},{}};local IH={{},{},{},{},{}}
 H[0]=function()done=true end
 H[1]=function(a,b)for i=a,b do R[i]=nil end end
 H[2]=function(a,b)R[a]=(b~=0)end
-H[3]=function(a,b,c,bx)R[a]=__getK(bx)end
+H[3]=function(a,b,c,bx)R[a]=${constResolveInline("bx")}end
 H[4]=function(a,b)R[a]=R[b]end
-H[5]=function(a,b,c,bx)R[a]=g[__getK(bx)]end
-H[6]=function(a,b,c,bx)g[__getK(bx)]=R[a]end
+H[5]=function(a,b,c,bx)R[a]=g[${constResolveInline("bx")}]end
+H[6]=function(a,b,c,bx)g[${constResolveInline("bx")}]=R[a]end
 H[7]=function(a,b)local u=U[b+1];if u and u.get then R[a]=u.get() end end
 H[8]=function(a,b)local u=U[b+1];if u and u.set then u.set(R[a]) end end
 H[9]=function(a)R[a]={}end
-H[10]=function(a,b,c) local t=R[b];local k=(c>=100000 and __getK(c-100000)or R[c]);R[a]=t[k] end
-H[11]=function(a,b,c) local t=R[a];local k=(b>=100000 and __getK(b-100000)or R[b]);t[k]=R[c] end
+H[10]=function(a,b,c) local t=R[b];local k=(c>=100000 and ${constResolveInline("c-100000")}or R[c]);R[a]=t[k] end
+H[11]=function(a,b,c) local t=R[a];local k=(b>=100000 and ${constResolveInline("b-100000")}or R[b]);t[k]=R[c] end
 H[12]=function(a,b,c)
 local fn=R[a]
 local meta=__WSClosureMeta[fn]
@@ -3122,7 +3466,7 @@ H[54]=function(a,b,c) R[a]=bit32.lshift(R[b],R[c]) end
 H[55]=function(a,b,c) R[a]=bit32.rshift(R[b],R[c]) end
 H[56]=function(a,b) R[a]=bit32.bnot(R[b]) end
 H[57]=function(a,b,c,bx)
-local globalName=__getK(bx);R[a]=g[globalName]
+local globalName=${constResolveInline("bx")};R[a]=g[globalName]
 local fn=R[a]
 if fn==nil then error("WSF_DIAG_MISSING_GLOBAL_CALL: "..tostring(globalName),0) end
 local meta=__WSClosureMeta[fn]
@@ -3155,7 +3499,7 @@ for i=want+1,math.max(n,1) do if i>1 then R[a+i-1]=nil end end
 __top=a+want
 end
 H[58]=function(a,b,c,bx,sbx)
-local globalName=__getK(bx);local memberName=__getK(sbx)
+local globalName=${constResolveInline("bx")};local memberName=${constResolveInline("sbx")}
 local obj=g[globalName]
 if obj==nil then error("WSF_DIAG_MISSING_GLOBAL_MEMBER: "..tostring(globalName).."."..tostring(memberName).." (global missing)",0) end
 local fn=obj[memberName]
@@ -3191,28 +3535,41 @@ for i=want+1,math.max(n,1) do if i>1 then R[a+i-1]=nil end end
 __top=a+want
 end
 H[59]=function(a,b,c,bx,sbx)
- local obj=g[__getK(bx)]
- R[a]=obj[__getK(sbx)]
+ local obj=g[${constResolveInline("bx")}]
+ R[a]=obj[${constResolveInline("sbx")}]
 end
 H[60]=function() end
-local __lastOp=0;local __dfstate=${(secureRandomFloat()*65520|0)+1}
-local __loopSalt=${Math.floor(secureRandomFloat() * 250) + 1}
+local __opcodeSeed=bit32.bxor(${fields.metaReadName}(P,2,1),${fields.metaReadName}(P,2,2),${fields.metaReadName}(P,2,3),${fields.metaReadName}(P,2,4),${fields.metaReadName}(P,2,5),${fields.metaReadName}(P,2,6),bit32.lshift(${fields.metaReadName}(P,1,1),16),${fields.metaReadName}(P,1,2),${fields.metaReadName}(P,1,3))
+for __si=1,#P.${fields.wp} do local __v=__WSAT_byte(P.${fields.wp},__si);__opcodeSeed=bit32.bxor(__opcodeSeed,__v,bit32.lshift(__v,7),bit32.rshift(__v,3));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.lshift(__opcodeSeed,13));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.rshift(__opcodeSeed,17));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.lshift(__opcodeSeed,5)) end
+for __si=1,#P.${fields.cp} do local __v=__WSAT_byte(P.${fields.cp},__si);__opcodeSeed=bit32.bxor(__opcodeSeed,__v,bit32.lshift(__v,7),bit32.rshift(__v,3));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.lshift(__opcodeSeed,13));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.rshift(__opcodeSeed,17));__opcodeSeed=bit32.bxor(__opcodeSeed,bit32.lshift(__opcodeSeed,5)) end
+if __opcodeSeed==0 then __opcodeSeed=0x6D2B79F5 end
+local __opcodeCacheIds,__opcodeCacheSlots={},{};local __opcodeCacheCursor=1
+local function ${opcodeResolverName}(wanted)
+ wanted=wanted%4294967296
+ for __ci=1,8 do if __opcodeCacheIds[__ci]==wanted then return __opcodeCacheSlots[__ci] end end
+ local __state=__opcodeSeed;local __previous=bit32.band(__state,255);local __b0,__b1,__b2,__b3,__slot=0,0,0,0,0;local __found=nil;local __record=0;local __prevCheck=bit32.band(__state,255)
+ for __oi=1,#P.${fields.o} do __state=bit32.bxor(__state,bit32.lshift(__state,13));__state=bit32.bxor(__state,bit32.rshift(__state,17));__state=bit32.bxor(__state,bit32.lshift(__state,5));local __cipher=bit32.bxor(__WSAT_byte(P.${fields.o},__oi),__WSAT_byte(P.${fields.o2},__oi));local __mask=bit32.band(bit32.rshift(__state,((__oi-1)%4)*8),255);local __plain=bit32.bxor(__cipher,__mask,__previous);__previous=__cipher;local __col=(__oi-1)%6;if __col==0 then __b0=__plain elseif __col==1 then __b1=__plain elseif __col==2 then __b2=__plain elseif __col==3 then __b3=__plain elseif __col==4 then __slot=__plain else __record=__record+1;local __id=__b0+__b1*256+__b2*65536+__b3*16777216;local __want=(__b0*3+__b1*5+__b2*7+__b3*11+__slot*13+__record*17+__prevCheck*19)%256;if __plain~=__want then __WSAT_error("WSF_DIAG_OPCODE_RECORD",0) end;if __id==wanted then __found=__slot end;__prevCheck=__plain end end
+ if __found~=nil then __opcodeCacheIds[__opcodeCacheCursor]=wanted;__opcodeCacheSlots[__opcodeCacheCursor]=__found;__opcodeCacheCursor=__opcodeCacheCursor%8+1 end
+ return __found
+end
+local __lastOp=0;local __dfstate=${(secureKeyFloat()*65520|0)+1}
+local __loopSalt=${Math.floor(secureKeyFloat() * 250) + 1}
 local __steps=0;local __maxSteps=${instructionBudget}
 while not done and (((pc*pc+__lastOp*17+sp*31+__loopSalt)%251)>=0) do
 __steps=__steps+1;__WSGlobalSteps=__WSGlobalSteps+1
 if __WSGlobalSteps>__maxSteps then error(${luaHiddenString("WSF_DIAG_STEP_LIMIT_HIDDEN")},0) end
 local __wordCount=math.floor(__buf.len(P.${fields.c})/4)
-if pc<1 or pc>#P.${fields.im} then error(${luaHiddenString("WSF_DIAG_PC_RANGE_HIDDEN")},0) end
+if pc<1 or pc>(#P.${fields.im}/4) then error(${luaHiddenString("WSF_DIAG_PC_RANGE_HIDDEN")},0) end
 __frameRecord.pc=pc;__frameRecord.state="running"
-${integrityFn ? `if __steps%${integrityInterval}==0 then __WSATCheck();if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack or __frameRecord.state~="running" then error("WSF_DIAG_CONSTANT_INDEX",0) end end` : ""}
-local __wordpc=P.${fields.im}[pc];if type(__wordpc)~="number" or __wordpc<1 or __wordpc>${decodedCacheName}ount then error("Invalid instruction map",0) end;local __il=P.${fields.v}==1;local ${encodedOpName}=D(__wordpc);if ${encodedOpName}<0 then ${encodedOpName}=${encodedOpName}+251 end;local ${maskedOpName}=P.${fields.o}[${encodedOpName}+1];if type(${maskedOpName})~="number" or ${maskedOpName}<0 or ${maskedOpName}>250 then error("Invalid opcode map entry: index="..tostring(${encodedOpName})..", tableLen="..tostring(#P.${fields.o})..", value="..tostring(${maskedOpName}),0) end;local op=((${maskedOpName}-P.${fields.x}-(${encodedOpName}*P.${fields.y})%251)%251+251)%251;local a,b,c,bx,sbx=0,0,0,0,0;local __oprd=__wordpc+1;${operandDecode}
+${integrityFn ? `if __steps%${integrityInterval}==0 then __WSATCheck(__frameCoroutine);if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack or __frameRecord.state~="running" then error("WSF_DIAG_CONSTANT_INDEX",0) end end` : ""}
+local __wordpc=${instructionMapReaderName}(P,pc);if type(__wordpc)~="number" or __wordpc<1 or __wordpc>${decodedCacheName}ount then error("Invalid instruction map",0) end;local __il=P.${fields.v}==1;local ${encodedOpName}=D(__wordpc);if ${encodedOpName}<0 then ${encodedOpName}=${encodedOpName}+4294967296 end;local op=${opcodeResolverName}(${encodedOpName});if type(op)~="number" or op<1 or op>250 then error("Invalid sparse opcode record",0) end;local a,b,c,bx,sbx=0,0,0,0,0;local __oprd=__wordpc+1;${operandDecode}
 pc=pc+1
 local __flowState=(pc*pc*${flowPcMul}+__lastOp*__lastOp*${flowLastMul}+(sp%251)*${flowStackMul})%251
 local __dispatchState=(op*${dispatchMultiplier}+__lastOp*${dispatchLastMul}+(sp%251)*${dispatchStackMul}+__flowState)%251
 local __dispatchOp=((((__dispatchState-__lastOp*${dispatchLastMul}-(sp%251)*${dispatchStackMul}-__flowState)%251)+251)%251*${dispatchInverse})%251
 __lastOp=op
-${integrityFn ? "__WSIntegrityAssert();" : ""}
-if __dispatchOp==0 then H[0](a,b,c,bx,sbx) else H[math.floor((__dispatchOp-1)/50)+1][(__dispatchOp-1)%50+1](a,b,c,bx,sbx) end
+${integrityFn ? "__WSVMGuard();" : ""}
+__execHandler(__dispatchOp,a,b,c,bx,sbx)
 __dfstate=(__dfstate+pc*17+op*31+__fsp+__frameRecord.id*7)%65521
 for __di=1,${12 + (secureRandomFloat()*13|0)} do __dfstate=(__dfstate*17+__di*__lastOp+pc+__fsp)%65521 end
 __push(__dfstate);__dfstate=(__pop()+__dfstate)%65521
@@ -3223,17 +3580,17 @@ local __wsShadowValue=(__dfstate*7+pc*29+op*11+__frameRecord.depth*37+__fsp*3)%6
 __WSIntegrityRing[__WSIntegrityCursor]=__wsRingValue
 __WSIntegrityShadowRing[__WSIntegrityCursor]=__wsShadowValue
 __WSIntegrityFold=0;__WSIntegrityAlt=1;__WSIntegrityShadowFold=0;__WSIntegrityShadowAlt=1
-for __di=1,8 do
+for __di=1,32 do
  __WSIntegrityFold=(__WSIntegrityFold*31+__WSIntegrityRing[__di]+__di*7)%65521
- __WSIntegrityAlt=(__WSIntegrityAlt*17+__WSIntegrityRing[9-__di]+__di*13)%65521
+ __WSIntegrityAlt=(__WSIntegrityAlt*17+__WSIntegrityRing[33-__di]+__di*13)%65521
  __WSIntegrityShadowFold=(__WSIntegrityShadowFold*37+__WSIntegrityShadowRing[__di]+__di*19)%65521
- __WSIntegrityShadowAlt=(__WSIntegrityShadowAlt*23+__WSIntegrityShadowRing[9-__di]+__di*31)%65521
+ __WSIntegrityShadowAlt=(__WSIntegrityShadowAlt*23+__WSIntegrityShadowRing[33-__di]+__di*31)%65521
 end
-__WSIntegrityCursor=__WSIntegrityCursor%8+1
+__WSIntegrityCursor=__WSIntegrityCursor%32+1
 ${__wsTimingNoiseBuild ? 'if op%3==0 then local __tn=0;for __tj=1,7 do __tn=(__tn+__tj*__lastOp+pc)%65521 end;if __tn<0 then error("WSF_DIAG_STEP_LIMIT",0) end end' : ""}
-${integrityFn ? `__integrityTick=__integrityTick+1;if __integrityTick%${integrityInterval}==0 then if ${integrityFn}(__rootIntegrity,0)~=(__rootIntegrity.${fields.s} or -1) or ${integrityFn}2(__rootIntegrity,0)~=(__rootIntegrity.${fields.s2} or -1) then __WSIntegrityFail(${luaHiddenString("WSF_DIAG_INTEGRITY_HASH")}) end;local __rf=0;local __ra=1;local __sf=0;local __sa=1;for __ri=1,8 do __rf=(__rf*31+__WSIntegrityRing[__ri]+__ri*7)%65521;__ra=(__ra*17+__WSIntegrityRing[9-__ri]+__ri*13)%65521;__sf=(__sf*37+__WSIntegrityShadowRing[__ri]+__ri*19)%65521;__sa=(__sa*23+__WSIntegrityShadowRing[9-__ri]+__ri*31)%65521 end;if __rf~=__WSIntegrityFold or __ra~=__WSIntegrityAlt or __sf~=__WSIntegrityShadowFold or __sa~=__WSIntegrityShadowAlt then __WSIntegrityFail(${luaHiddenString("WSF_DIAG_VM_HIDDEN_FAILURE")}) end end` : ""}
+${integrityFn ? `__integrityTick=__integrityTick+1;if __integrityTick%${integrityInterval}==0 then if ${integrityFn}(__rootIntegrity,0)~=(__rootIntegrity.${fields.s} or -1) or ${integrityFn}2(__rootIntegrity,0)~=(__rootIntegrity.${fields.s2} or -1) then ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_INTEGRITY_HASH")},0)`} end;local __rf=0;local __ra=1;local __sf=0;local __sa=1;for __ri=1,32 do __rf=(__rf*31+__WSIntegrityRing[__ri]+__ri*7)%65521;__ra=(__ra*17+__WSIntegrityRing[33-__ri]+__ri*13)%65521;__sf=(__sf*37+__WSIntegrityShadowRing[__ri]+__ri*19)%65521;__sa=(__sa*23+__WSIntegrityShadowRing[33-__ri]+__ri*31)%65521 end;if __rf~=__WSIntegrityFold or __ra~=__WSIntegrityAlt or __sf~=__WSIntegrityShadowFold or __sa~=__WSIntegrityShadowAlt then ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_VM_HIDDEN_FAILURE")},0)`} end end` : ""}
 end
-${integrityFn ? `__WSATCheck();if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack then __WSAT_error("WSF_DIAG_PC_RANGE",0) end;if ${integrityFn}(__rootIntegrity,0)~=(__rootIntegrity.${fields.s} or -1) or ${integrityFn}2(__rootIntegrity,0)~=(__rootIntegrity.${fields.s2} or -1) then __WSIntegrityFail(${luaHiddenString("WSF_DIAG_FINAL_INTEGRITY")}) end` : ""}
+${integrityFn ? `__WSATCheck(__frameCoroutine);if __WSFrameStack[#__WSFrameStack]~=__frameRecord or __frameRecord.proto~=P or __frameRecord.depth~=#__WSFrameStack then __WSAT_error("WSF_DIAG_PC_RANGE",0) end;if ${integrityFn}(__rootIntegrity,0)~=(__rootIntegrity.${fields.s} or -1) or ${integrityFn}2(__rootIntegrity,0)~=(__rootIntegrity.${fields.s2} or -1) then ${integrityPolicy === "strict" ? '__WSAT_error("WSF_INTEGRITY_FAILED",0)' : `__WSAT_error(${luaHiddenString("WSF_DIAG_FINAL_INTEGRITY")},0)`} end` : ""}
 local __returnValues=res;local __returnCount=__returnValues.n or #__returnValues
 __frameRecord.transition=__frameRecord.transition+1;__frameRecord.state="returned";__frameRecord.returnCount=__returnCount
 if __WSFrameStack[#__WSFrameStack]==__frameRecord then __WSFrameStack[#__WSFrameStack]=nil end
@@ -3286,36 +3643,530 @@ local function __WSRun(__rootProto,__rootUpvalues,...)
  end
 end
 `;
+  // V8.2.1 restored closure-banked dispatcher (V8.1 proven lowering).
+  // Each lowered micro-operation is emitted as an independently shuffled closure.
+  // Two feedback-coded manifests map dispatch tags -> bank/slot at runtime.
+  // This restores V8.1's indirect bank layout and removes V8.2's linear kind==N
+  // branch chain. It is reverse-engineering friction only: closure bodies and
+  // runtime manifests remain observable to a sufficiently capable client analyst.
   const original = new Map(VM_OP_LIST.map((name, i) => [i + 1, name]));
-  // Shard opcode handlers across five tables. The randomized sparse opcode ID
-  // selects a shard and a local slot, avoiding one flat H[opcode] dispatcher.
-  engine = engine.replace(/H\[(\d+)\]=/g, (whole, n) => {
-    const oldId = Number(n);
-    if (oldId === 0) return whole;
-    const name = original.get(oldId);
-    const id = handlerMap.get(name);
-    if (!Number.isInteger(id)) throw new Error("Missing randomized VM handler slot for " + name);
-    const shard = Math.floor((id - 1) / 50) + 1;
-    const slot = ((id - 1) % 50) + 1;
-    return `H[${shard}][${slot}]=`;
-  });
-  // Build a second opcode namespace for nested prototypes. Its slots point to the
-  // semantic handlers, but the encoded opcode IDs and dispatch decision tree differ.
-  const innerLinks = [`IH[0]=H[0]`];
-  for (const [name, innerId] of innerOpMap.entries()) {
-    const handlerId = handlerMap.get(name);
-    const os = Math.floor((handlerId - 1) / 50) + 1, ol = ((handlerId - 1) % 50) + 1;
-    const is = Math.floor((innerId - 1) / 50) + 1, il = ((innerId - 1) % 50) + 1;
-    innerLinks.push(`IH[${is}][${il}]=H[${os}][${ol}]`);
+  const handlerBlockStart = engine.indexOf('H[0]=function');
+  const handlerBlockEnd = engine.indexOf('local __lastOp=', handlerBlockStart);
+  if (handlerBlockStart < 0 || handlerBlockEnd < 0) {
+    throw new Error('Unable to locate VM handler declarations for closure-banked lowering');
   }
-  // P.o is a per-prototype opcode->physical-handler map, so the runtime dispatch
-  // structure differs for each prototype without a shared opcode decision tree.
+  const handlerSource = engine.slice(handlerBlockStart, handlerBlockEnd);
+  const handlerStarts = [];
+  const handlerStartRe = /(?:^|\n)(H\[\d+\](?:\[\d+\])?=function)/g;
+  let handlerMatch;
+  while ((handlerMatch = handlerStartRe.exec(handlerSource)) !== null) {
+    handlerStarts.push(handlerMatch.index + (handlerMatch[0].startsWith('\n') ? 1 : 0));
+  }
+  if (handlerStarts.length !== VM_OP_LIST.length + 1) {
+    throw new Error('Source VM handler parse count mismatch before closure-banked lowering: ' + handlerStarts.length);
+  }
+
+  const microSpec = {
+    LOADNIL:[2,0], LOADBOOL:[3,0], LOADK:[4,0], MOVE:[5,0],
+    GETGLOBAL:[6,0], SETGLOBAL:[7,0], GETUPVAL:[8,0], SETUPVAL:[9,0],
+    NEWTABLE:[10,0], GETTABLE:[11,0], SETTABLE:[12,0], CALL:[13,0],
+    RETURN:[14,0], VARARG:[15,0], CLOSURE:[16,0], JMP:[17,0],
+    JMPIF:[18,0], JMPIFNOT:[19,0], UNM:[20,1], NOT:[20,2], LEN:[20,3],
+    ADD:[21,1], SUB:[21,2], MUL:[21,3], DIV:[21,4], MOD:[21,5], POW:[21,6],
+    IDIV:[21,7], CONCAT:[21,8], FORPREP:[22,0], FORLOOP:[23,0], TFORLOOP:[24,0],
+    CMPEQ:[21,9], CMPNE:[21,10], CMPLT:[21,11], CMPLE:[21,12], CMPGT:[21,13],
+    CMPGE:[21,14], BOR:[21,15], BAND:[21,16],
+    FUSED_MOVE_ADD:[21,1], FUSED_MOVE_SUB:[21,2], FUSED_MOVE_MUL:[21,3],
+    FUSED_MOVE_DIV:[21,4], MATHCLAMP:[25,1], MATHFLOOR:[25,2], MATHCEIL:[25,3],
+    MATHABS:[25,4], MATHSQRT:[25,5], MATHMIN:[25,6], MATHMAX:[25,7],
+    FUSED_GETTABLE_ADD_SETTABLE:[26,0], BXOR:[21,17], SHL:[21,18], SHR:[21,19],
+    BNOT:[20,4], FUSED_GETGLOBAL_CALL:[13,1], FUSED_GLOBAL_MEMBER_CALL:[13,2],
+    FUSED_GLOBAL_MEMBER_LOOKUP:[13,3], NOP:[27,0]
+  };
+  for (const semantic of VM_OP_LIST) {
+    const spec = microSpec[semantic];
+    if (!Array.isArray(spec) || spec.length !== 2 || !spec.every(Number.isInteger)) {
+      throw new Error('Missing or malformed micro-op lowering for ' + semantic);
+    }
+  }
+
+  const microCallName = makeVmLocal();
+  const microLookupName = makeVmLocal();
+  const microManifestNameA = makeVmLocal();
+  const microManifestNameB = makeVmLocal();
+  const microProgramPoolName = makeVmLocal();
+  const microExecName = makeVmLocal();
+  const microManifestSeed = (Math.floor(secureKeyFloat()*4294967295)>>>0) || 0x9E3779B9;
+  const handlerBodies = new Map([
+    ['1:0', 'done=true'],
+    ['2:0', 'for i=a,b do R[i]=nil end'],
+    ['3:0', 'R[a]=(b~=0)'],
+    ['4:0', `R[a]=${constResolveInline("bx")}`],
+    ['5:0', 'R[a]=R[b]'],
+    ['6:0', `R[a]=g[${constResolveInline("bx")}]`],
+    ['7:0', `g[${constResolveInline("bx")}]=R[a]`],
+    ['8:0', 'local u=U[b+1];if u and u.get then R[a]=u.get() end'],
+    ['9:0', 'local u=U[b+1];if u and u.set then u.set(R[a]) end'],
+    ['10:0', 'R[a]={}'],
+    ['11:0', `local t=R[b];local k=(c>=100000 and ${constResolveInline("c-100000")} or R[c]);R[a]=t[k]`],
+    ['12:0', `local t=R[a];local k=(b>=100000 and ${constResolveInline("b-100000")} or R[b]);t[k]=R[c]`],
+    ['13:0', `${microCallName}(0,a,b,c,bx,sbx)`],
+    ['13:1', `${microCallName}(1,a,b,c,bx,sbx)`],
+    ['13:2', `${microCallName}(2,a,b,c,bx,sbx)`],
+    ['13:3', `${microCallName}(3,a,b,c,bx,sbx)`],
+    ['14:0', 'local n=(b==0 and (__top-a) or b-1);if n<0 then n=0 end;res={};for i=1,n do res[i]=R[a+i-1] end;res.n=n;__frameRecord.state="return";__frameRecord.returnValues=res;__frameRecord.returnCount=n;done=true'],
+    ['15:0', 'local n=(b==0 and (#args-__NP) or b-1);if n<0 then n=0 end;for i=1,n do R[a+i-1]=args[__NP+i] end;__top=a+n'],
+    ['16:0', `local child=P.${fields.p}[bx+1];local cuv=child.${fields.u};local up={};for i=1,#cuv do local e=cuv[i];if e[1]==1 then local ri=e[2];local uk=(__stackSalt+pc*37+ri*13)%65521;up[i]=__WSUVCell(R,bit32.bxor(ri,uk),uk) else up[i]=U[e[2]+1] end end;local closure=function(...)return __WSN(child,up,...)end;__WSClosureMeta[closure]={proto=child,upvalues=up};R[a]=closure`],
+    ['17:0', 'pc=pc+sbx'],
+    ['18:0', 'pc=pc+(__mbaTruthy(R[a]) and sbx or 0)'],
+    ['19:0', 'pc=pc+((not __mbaTruthy(R[a])) and sbx or 0)'],
+    ['20:1', 'R[a]=-R[b]'],
+    ['20:2', 'R[a]=not R[b]'],
+    ['20:3', 'R[a]=#R[b]'],
+    ['20:4', 'R[a]=bit32.bnot(R[b])'],
+    ['21:1', 'R[a]=__mbaAdd(R[b],R[c])'],
+    ['21:2', 'R[a]=R[b]-R[c]'],
+    ['21:3', 'R[a]=R[b]*R[c]'],
+    ['21:4', 'R[a]=R[b]/R[c]'],
+    ['21:5', 'R[a]=R[b]%R[c]'],
+    ['21:6', 'R[a]=R[b]^R[c]'],
+    ['21:7', 'R[a]=__idiv(R[b],R[c])'],
+    ['21:8', 'R[a]=__WSAT_tostring(R[b])..__WSAT_tostring(R[c])'],
+    ['21:9', 'R[a]=R[b]==R[c]'],
+    ['21:10', 'R[a]=R[b]~=R[c]'],
+    ['21:11', 'R[a]=R[b]<R[c]'],
+    ['21:12', 'R[a]=R[b]<=R[c]'],
+    ['21:13', 'R[a]=R[b]>R[c]'],
+    ['21:14', 'R[a]=R[b]>=R[c]'],
+    ['21:15', 'R[a]=bit32.bor(R[b],R[c])'],
+    ['21:16', 'R[a]=bit32.band(R[b],R[c])'],
+    ['21:17', 'R[a]=bit32.bxor(R[b],R[c])'],
+    ['21:18', 'R[a]=bit32.lshift(R[b],R[c])'],
+    ['21:19', 'R[a]=bit32.rshift(R[b],R[c])'],
+    ['22:0', 'R[a]=R[a]-R[a+2];pc=pc+sbx'],
+    ['23:0', 'R[a]=R[a]+R[a+2];local lim=R[a+1];local st=R[a+2];if(st>0 and R[a]<=lim)or(st<=0 and R[a]>=lim)then R[a+3]=R[a];pc=pc+sbx end'],
+    ['24:0', 'local f=R[a];local rr=table.pack(f(R[a+1],R[a+2]));for i=1,c do R[a+2+i]=rr[i] end;if R[a+3]~=nil then R[a+2]=R[a+3] end'],
+    ['25:1', 'local x=R[b];local lo=R[c];local hi=R[bx];if __WSAT_type(x)~="number" or __WSAT_type(lo)~="number" or __WSAT_type(hi)~="number" then __WSAT_error("MATHCLAMP expects numeric operands",0) end;if x<lo then x=lo elseif x>hi then x=hi end;R[a]=x'],
+    ['25:2', 'local x=R[b];if __WSAT_type(x)~="number" then __WSAT_error("MATHFLOOR expects number",0) end;R[a]=__WSAT_floor(x)'],
+    ['25:3', 'local x=R[b];if __WSAT_type(x)~="number" then __WSAT_error("MATHCEIL expects number",0) end;R[a]=__WSAT_ceil(x)'],
+    ['25:4', 'local x=R[b];if __WSAT_type(x)~="number" then __WSAT_error("MATHABS expects number",0) end;R[a]=__WSAT_abs(x)'],
+    ['25:5', 'local x=R[b];if __WSAT_type(x)~="number" then __WSAT_error("MATHSQRT expects number",0) end;R[a]=__WSAT_sqrt(x)'],
+    ['25:6', 'local x=R[b];if __WSAT_type(x)~="number" or __WSAT_type(R[c])~="number" then __WSAT_error("MATHMIN expects numbers",0) end;R[a]=__WSAT_min(x,R[c])'],
+    ['25:7', 'local x=R[b];if __WSAT_type(x)~="number" or __WSAT_type(R[c])~="number" then __WSAT_error("MATHMAX expects numbers",0) end;R[a]=__WSAT_max(x,R[c])'],
+    ['26:0', 'local t=R[a];local k=R[b];local old=t[k];local rhs=(c==bx and old or R[c]);t[k]=old+rhs'],
+    ['27:0', 'do end']
+  ]);
+
+  const slotSemantics = new Map([[0, '__HALT__']]);
+  for (const semantic of VM_OP_LIST) {
+    const slot = handlerMap.get(semantic);
+    if (!Number.isInteger(slot) || slot < 1 || slot > 250 || slotSemantics.has(slot)) {
+      throw new Error('Invalid VM closure-dispatch slot for ' + semantic);
+    }
+    slotSemantics.set(slot, semantic);
+  }
+  if (slotSemantics.size !== VM_OP_LIST.length + 1) throw new Error('VM closure-dispatch handler set is incomplete');
+
+  const uniquePairs = new Map();
+  uniquePairs.set('1:0', { op:1, sub:0, label:'__HALT__' });
+  for (const semantic of VM_OP_LIST) {
+    const [op, sub] = microSpec[semantic];
+    const key = `${op}:${sub}`;
+    if (!uniquePairs.has(key)) uniquePairs.set(key, { op, sub, label:semantic });
+  }
+  for (const key of uniquePairs.keys()) {
+    if (!handlerBodies.has(key)) throw new Error('No dedicated closure body exists for micro-operation ' + key);
+  }
+  const handlerList = Array.from(uniquePairs.entries()).map(([key, value]) => ({ key, ...value }));
+  // Shuffle physical closure placements independently from semantic opcode order.
+  for (let i = handlerList.length - 1; i > 0; i--) {
+    const j = secureRandomFloat() * (i + 1) | 0;
+    [handlerList[i], handlerList[j]] = [handlerList[j], handlerList[i]];
+  }
+  // V8.1: semantic closures remain independently shuffled,
+  // positional closure pool. The runtime manifest maps ordinal -> pool index;
+  // no numeric token is adjacent to a semantic body and no `if kind == N`
+  // decision chain is emitted. The pool and mapping remain client-visible and
+  // reversible, but straightforward kind-to-body regex extraction is removed.
+  const programOrder = handlerList.slice();
+  for (let i = programOrder.length - 1; i > 0; i--) {
+    const j = secureRandomFloat() * (i + 1) | 0;
+    [programOrder[i], programOrder[j]] = [programOrder[j], programOrder[i]];
+  }
+  for (let hi = 0; hi < handlerList.length; hi++) handlerList[hi].microOrdinal = hi + 1;
+  for (let fi = 0; fi < programOrder.length; fi++) programOrder[fi].programIndex = fi + 1;
+  // Each logical micro-operation is represented as a randomized numeric mini-VM
+  // instruction. The emitted pool is data, not a table of Lua closures.
+  const usedMicroCodes = new Set();
+  for (const h of handlerList) {
+    let code;
+    do { code = 1 + (secureKeyFloat() * 0xFFFFFF | 0); } while (usedMicroCodes.has(code));
+    usedMicroCodes.add(code);
+    h.microCode = code;
+  }
+
+  // Four-byte record: ordinal:u16 + randomized factory-pool index:u16.
+  // The encrypted mapping is not a cryptographic secret; it simply separates
+  // the numeric dispatch identity from the closure body position.
+  const microManifestPlain = [];
+  for (const h of handlerList) microManifestPlain.push(
+    h.microOrdinal & 255, (h.microOrdinal >>> 8) & 255,
+    h.programIndex & 255, (h.programIndex >>> 8) & 255
+  );
+  let microState = microManifestSeed >>> 0, microPrev = microState & 255;
+  const microManifestCipher = microManifestPlain.map((value, index) => {
+    microState = (microState ^ (microState << 13)) >>> 0;
+    microState = (microState ^ (microState >>> 17)) >>> 0;
+    microState = (microState ^ (microState << 5)) >>> 0;
+    const mask = (microState >>> ((index % 4) * 8)) & 255;
+    const cipher = (value ^ mask ^ microPrev) & 255;
+    microPrev = cipher;
+    return cipher;
+  });
+  const microManifestShareB = microManifestCipher.map(() => (secureKeyFloat() * 256) | 0);
+  const microManifestShareA = microManifestCipher.map((value, index) => (value ^ microManifestShareB[index]) & 255);
+  const microManifestLiteralA = '"' + microManifestShareA.map(v => '\\' + String(v).padStart(3, '0')).join('') + '"';
+  const microManifestLiteralB = '"' + microManifestShareB.map(v => '\\' + String(v).padStart(3, '0')).join('') + '"';
+  const bankCount = 4;
+  const bankNames = Array.from({ length: bankCount }, () => makeVmLocal());
+  const dispatchName = makeVmLocal();
+  const dispatchBlobName = makeVmLocal();
+  const dispatchBlobNameB = makeVmLocal();
+  const tagFnName = makeVmLocal();
+  const bankArrayName = makeVmLocal();
+  const bankSlots = Array.from({ length: bankCount }, () => 0);
+  const pairPlacement = new Map();
+  for (let i = 0; i < handlerList.length; i++) {
+    const targetBank = i % bankCount;
+    const bank = (targetBank + (secureRandomFloat() * bankCount | 0)) % bankCount;
+    const slot = ++bankSlots[bank];
+    if (slot > 255) throw new Error('VM handler bank slot overflow');
+    handlerList[i].bank = bank + 1;
+    handlerList[i].bankSlot = slot;
+    pairPlacement.set(handlerList[i].key, { bank:bank + 1, slot });
+  }
+
+  const dispatchKeys = Array.from({ length: 16 }, () => secureKeyFloat() * 4096 | 0);
+  const dispatchKeyBytes = [];
+  for (const key of dispatchKeys) dispatchKeyBytes.push((key >>> 8) & 15, key & 255);
+  // V7.4: feedback-coded key bytes replace the directly invertible affine codec.
+  // The seed remains in client output, so this is obfuscation, not secrecy.
+  const dispatchKeyCodecSeed = (Math.floor(secureKeyFloat() * 4294967295) >>> 0) || 0xA341316C;
+  let dispatchKeyCodecState = dispatchKeyCodecSeed >>> 0;
+  let previousDispatchKeyCipher = dispatchKeyCodecState & 255;
+  const encodedDispatchKeyBytes = dispatchKeyBytes.map((value, index) => {
+    dispatchKeyCodecState = (dispatchKeyCodecState ^ (dispatchKeyCodecState << 13)) >>> 0;
+    dispatchKeyCodecState = (dispatchKeyCodecState ^ (dispatchKeyCodecState >>> 17)) >>> 0;
+    dispatchKeyCodecState = (dispatchKeyCodecState ^ (dispatchKeyCodecState << 5)) >>> 0;
+    const mask = (dispatchKeyCodecState >>> ((index % 4) * 8)) & 255;
+    const cipher = (value ^ mask ^ previousDispatchKeyCipher) & 255;
+    previousDispatchKeyCipher = cipher;
+    return cipher;
+  });
+  const dispatchKeyBlob = '"' + encodedDispatchKeyBytes.map(value => "\\" + String(value).padStart(3, "0")).join("") + '"';
+  const permuteDispatchTag = value => {
+    let left = (Math.floor(value / 4096) & 4095), right = (value & 4095);
+    for (let r = 0; r < dispatchKeys.length; r++) {
+      const q = r + 1, k = dispatchKeys[r];
+      const f = (right * right * 3 + right * k + q * 97 + k * k * 5) % 4096;
+      const next = (left + f) % 4096;
+      left = right; right = next;
+    }
+    return left * 4096 + right;
+  };
+
+  const bankDecls = bankNames.map(name => `local ${name}={}`).join('\n');
+  // V8.1: bank-slot -> ordinal links are no longer emitted as source-level
+  // assignments. A second independently seeded feedback manifest creates the
+  // generic bank closures only after the ordinal/pool manifest has been decoded.
+  const bankManifestSeed = (Math.floor(secureKeyFloat()*4294967295)>>>0) || 0xB5297A4D;
+  const bankRotationSeed = (Math.floor(secureKeyFloat()*4294967295)>>>0) || 0x68E31DA4;
+  const bankManifestPlain = [];
+  for (const h of handlerList) bankManifestPlain.push(
+    h.microOrdinal & 255, (h.microOrdinal >>> 8) & 255, h.bank & 255, h.bankSlot & 255
+  );
+  let bankState = bankManifestSeed >>> 0, bankPrev = bankState & 255;
+  const bankManifestCipher = bankManifestPlain.map((value,index)=>{
+    bankState=(bankState^(bankState<<13))>>>0;
+    bankState=(bankState^(bankState>>>17))>>>0;
+    bankState=(bankState^(bankState<<5))>>>0;
+    const mask=(bankState>>>((index%4)*8))&255;
+    const cipher=(value^mask^bankPrev)&255;bankPrev=cipher;return cipher;
+  });
+  const bankManifestShareB=bankManifestCipher.map(()=>secureKeyFloat()*256|0);
+  const bankManifestShareA=bankManifestCipher.map((v,i)=>(v^bankManifestShareB[i])&255);
+  const bankManifestLiteralA='"'+bankManifestShareA.map(v=>'\\'+String(v).padStart(3,'0')).join('')+'"';
+  const bankManifestLiteralB='"'+bankManifestShareB.map(v=>'\\'+String(v).padStart(3,'0')).join('')+'"';
+  const bankExpectedCounts=bankSlots.slice();
+  // V8.2.6: micro-operations are serialized as numeric mini-VM instruction IDs.
+  // No per-operation Lua functions or factory closures are emitted into the pool.
+  const microProgramPoolDecl = `local ${microProgramPoolName}={${programOrder.map(h => h.microCode).join(',')}}`;
+  const microCaseOrder = handlerList.slice();
+  for (let i = microCaseOrder.length - 1; i > 0; i--) {
+    const j = secureRandomFloat() * (i + 1) | 0;
+    [microCaseOrder[i], microCaseOrder[j]] = [microCaseOrder[j], microCaseOrder[i]];
+  }
+  const microInterpreterCases = microCaseOrder.map((h, index) => {
+    const body = handlerBodies.get(h.key);
+    if (typeof body !== 'string') throw new Error('Missing mini-VM instruction body for ' + h.key);
+    return `${index ? 'elseif' : 'if'} code==${h.microCode} then ${body};return `;
+  }).join('');
+  const microInterpreterDecl = `local function ${microExecName}(code,a,b,c,bx,sbx) ${microInterpreterCases}else __WSAT_error("WSF_DIAG_INVALID_VM_HANDLER",0) end end`;
+  const emittedMicroPrograms = programOrder.length;
+  if (emittedMicroPrograms !== handlerList.length || handlerList.length !== uniquePairs.size || usedMicroCodes.size !== handlerList.length) {
+    throw new Error('Mini-VM program lowering count mismatch: ' + emittedMicroPrograms + '/' + handlerList.length);
+  }
+  const rawDispatchBytes = [];
+  const dispatchTags = new Set();
+  let recordNo = 0;
+  for (const [physicalSlot, semantic] of slotSemantics) {
+    const pair = semantic === '__HALT__' ? '1:0' : `${microSpec[semantic][0]}:${microSpec[semantic][1]}`;
+    const location = pairPlacement.get(pair);
+    if (!location) throw new Error('Missing closure bank placement for ' + semantic);
+    const tag = permuteDispatchTag(physicalSlot);
+    if (dispatchTags.has(tag)) throw new Error('24-bit VM dispatch tag collision');
+    dispatchTags.add(tag);
+    recordNo++;
+    const hi = (tag >>> 16) & 255, mid = (tag >>> 8) & 255, lo = tag & 255;
+    const bank = location.bank, slot = location.slot;
+    const previousCheck = recordNo === 1 ? (dispatchKeys[0] & 255) : rawDispatchBytes[rawDispatchBytes.length - 1];
+    const check = (hi * 3 + mid * 5 + lo * 7 + bank * 11 + slot * 13 + recordNo * 17 +
+      ((hi * mid + lo * bank + slot * recordNo) % 251) + previousCheck * 19) % 256;
+    rawDispatchBytes.push(hi, mid, lo, bank, slot, check);
+  }
+  if (recordNo !== VM_OP_LIST.length + 1) throw new Error('V8.2.6 dispatch manifest size mismatch');
+  // Nonlinear feedback codec: each manifest byte depends on two Feistel keys,
+  // its position, and the previous ciphertext byte (not a single affine inverse).
+  let previousDispatchCipher = dispatchKeys[15] & 255;
+  const encodedDispatchBytes = rawDispatchBytes.map((value, index) => {
+    const pos = index + 1;
+    const k1 = dispatchKeys[index % 16];
+    const k2 = dispatchKeys[(index + 7) % 16];
+    const mask = (k1 + pos * 17 + previousDispatchCipher * 3 + (k2 ^ (pos * 29))) & 255;
+    const cipher = (value ^ mask) & 255;
+    previousDispatchCipher = cipher;
+    return cipher;
+  });
+  const dispatchShareB = encodedDispatchBytes.map(() => (secureRandomFloat()*256)|0);
+  const dispatchShareA = encodedDispatchBytes.map((value,index)=>(value^dispatchShareB[index])&255);
+  const dispatchBlobA = '"' + dispatchShareA.map(value => '\\' + String(value).padStart(3, '0')).join('') + '"';
+  const dispatchBlobB = '"' + dispatchShareB.map(value => '\\' + String(value).padStart(3, '0')).join('') + '"';
+
+  const microRuntime = `
+local ${microCallName}
+${microProgramPoolDecl}
+local ${microLookupName}={}
+${microInterpreterDecl}
+local ${microManifestNameA}=${microManifestLiteralA};local ${microManifestNameB}=${microManifestLiteralB}
+if #${microManifestNameA}~=${microManifestCipher.length} or #${microManifestNameB}~=${microManifestCipher.length} or #${microManifestNameA}%4~=0 then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+local __microState=${microManifestSeed};local __microPrev=bit32.band(__microState,255);local __microPlain={}
+for i=1,#${microManifestNameA} do __microState=bit32.bxor(__microState,bit32.lshift(__microState,13));__microState=bit32.bxor(__microState,bit32.rshift(__microState,17));__microState=bit32.bxor(__microState,bit32.lshift(__microState,5));local shareA=__WSAT_byte(${microManifestNameA},i);local shareB=__WSAT_byte(${microManifestNameB},i);local cipher=bit32.bxor(shareA,shareB);local mask=bit32.band(bit32.rshift(__microState,((i-1)%4)*8),255);__microPlain[i]=bit32.bxor(cipher,mask,__microPrev);__microPrev=cipher end
+local __microSeenOrdinal, __microSeenPool={},{}
+for i=1,#__microPlain,4 do
+ local ordinal=__microPlain[i]+__microPlain[i+1]*256
+ local poolIndex=__microPlain[i+2]+__microPlain[i+3]*256
+ local miniCode=${microProgramPoolName}[poolIndex]
+ if ordinal<1 or ordinal>${handlerList.length} or poolIndex<1 or poolIndex>${handlerList.length} or __microSeenOrdinal[ordinal] or __microSeenPool[poolIndex] or __WSAT_type(miniCode)~="number" or miniCode%1~=0 then __WSAT_error("WSF_INTEGRITY_FAILED",0) end
+ __microSeenOrdinal[ordinal]=true;__microSeenPool[poolIndex]=true;${microLookupName}[ordinal]=poolIndex
+end
+for i=1,${handlerList.length} do if __WSAT_type(${microLookupName}[i])~="number" or ${microLookupName}[i]<1 or ${microLookupName}[i]>${handlerList.length} or not __microSeenPool[i] then __WSAT_error("WSF_INTEGRITY_FAILED",0) end end
+for i=1,#__microPlain do __microPlain[i]=nil end
+__microPlain=nil;__microSeenOrdinal=nil;__microSeenPool=nil
+${bankDecls}
+local ${bankArrayName}={${bankNames.join(',')}}
+local __bankMapA=${bankManifestLiteralA};local __bankMapB=${bankManifestLiteralB}
+local ${tagFnName}KeyBlob=${dispatchKeyBlob}
+local ${tagFnName}Keys={}
+if #${tagFnName}KeyBlob~=32 then __WSAT_error("WSF_DIAG_DISPATCH_KEY_SIZE",0) end
+local __tagCodecState=${dispatchKeyCodecSeed};local __tagCodecPrev=bit32.band(__tagCodecState,255)
+for i=1,32 do __tagCodecState=bit32.bxor(__tagCodecState,bit32.lshift(__tagCodecState,13));__tagCodecState=bit32.bxor(__tagCodecState,bit32.rshift(__tagCodecState,17));__tagCodecState=bit32.bxor(__tagCodecState,bit32.lshift(__tagCodecState,5));local e=__WSAT_byte(${tagFnName}KeyBlob,i);local mask=bit32.band(bit32.rshift(__tagCodecState,((i-1)%4)*8),255);local d=bit32.bxor(e,mask,__tagCodecPrev);__tagCodecPrev=e;if i%2==1 then ${tagFnName}Keys[(i+1)/2]=d*256 else ${tagFnName}Keys[(i+1)/2]=${tagFnName}Keys[(i+1)/2]+d end end
+local function ${tagFnName}(v)
+ local l=math.floor(v/4096)%4096;local r=v%4096
+ for q=1,16 do local k=${tagFnName}Keys[q];local f=(r*r*3+r*k+q*97+k*k*5)%4096;l,r=r,(l+f)%4096 end
+ return l*4096+r
+end
+local ${dispatchBlobName}=${dispatchBlobA};local ${dispatchBlobNameB}=${dispatchBlobB}
+local ${dispatchName}={}
+local __wsCanonicalBanks={${bankNames.join(',')}}
+local __wsDispatchRotation=0
+local __wsDispatchEpoch=0
+local __wsRotationSeed=${bankRotationSeed}
+local __wsBankPermutation={1,2,3,4}
+local __wsRotationInterval=${21+(Math.floor(secureRandomFloat()*17))}
+local __bankExpected={${bankExpectedCounts.join(',')}}
+if #${dispatchBlobName}~=${encodedDispatchBytes.length} or #${dispatchBlobNameB}~=${encodedDispatchBytes.length} or #${dispatchBlobName}%6~=0 then __WSAT_error("WSF_DIAG_DISPATCH_MANIFEST_SIZE",0) end
+if #__bankMapA~=${bankManifestCipher.length} or #__bankMapB~=${bankManifestCipher.length} or #__bankMapA%4~=0 then __WSAT_error("WSF_DIAG_BANK_MANIFEST_SIZE",0) end
+local function __wsBuildDispatch(rotation)
+ -- Rebuild logical banks from the encrypted bank manifest. Each epoch derives
+ -- a fresh four-bank permutation instead of cycling through four fixed rotations.
+ local bankPermutation={1,2,3,4}
+ local shuffleState=bit32.bxor(__wsRotationSeed,rotation,${bankManifestSeed})
+ for pi=${bankCount},2,-1 do
+  shuffleState=bit32.bxor(shuffleState,bit32.lshift(shuffleState,13));shuffleState=bit32.bxor(shuffleState,bit32.rshift(shuffleState,17));shuffleState=bit32.bxor(shuffleState,bit32.lshift(shuffleState,5))
+  local pj=(shuffleState%pi)+1;bankPermutation[pi],bankPermutation[pj]=bankPermutation[pj],bankPermutation[pi]
+ end
+ for bi=1,${bankCount} do local bank=__wsCanonicalBanks[bi];for k=1,__bankExpected[bi] do bank[k]=nil end end
+ local bankState=${bankManifestSeed};local bankPrev=bit32.band(bankState,255)
+ local o0,o1,bankId,slot=0,0,0,0
+ local bankSeenOrdinal,bankSeenSlot={},{}
+ local bankRecords=0
+ for i=1,#__bankMapA do
+  bankState=bit32.bxor(bankState,bit32.lshift(bankState,13));bankState=bit32.bxor(bankState,bit32.rshift(bankState,17));bankState=bit32.bxor(bankState,bit32.lshift(bankState,5))
+  local cipher=bit32.bxor(__WSAT_byte(__bankMapA,i),__WSAT_byte(__bankMapB,i))
+  local mask=bit32.band(bit32.rshift(bankState,((i-1)%4)*8),255)
+  local plain=bit32.bxor(cipher,mask,bankPrev);bankPrev=cipher
+  local col=(i-1)%4
+  if col==0 then o0=plain elseif col==1 then o1=plain elseif col==2 then bankId=plain else
+   slot=plain;bankRecords=bankRecords+1
+   local ordinal=o0+o1*256;local key=bankId..":"..slot
+   local bank=__wsCanonicalBanks[bankId];local poolIndex=${microLookupName}[ordinal]
+   if ordinal<1 or ordinal>${handlerList.length} or bank==nil or slot<1 or slot>(__bankExpected[bankId] or 0) or bankSeenOrdinal[ordinal] or bankSeenSlot[key] or __WSAT_type(poolIndex)~="number" or poolIndex<1 or poolIndex>${handlerList.length} then __WSAT_error("WSF_DIAG_BANK_MANIFEST",0) end
+   bankSeenOrdinal[ordinal]=true;bankSeenSlot[key]=true;bank[slot]=poolIndex
+  end
+ end
+ if bankRecords~=${handlerList.length} then __WSAT_error("WSF_DIAG_BANK_MANIFEST",0) end
+ for ordinal=1,${handlerList.length} do if not bankSeenOrdinal[ordinal] then __WSAT_error("WSF_DIAG_BANK_MANIFEST",0) end end
+ for bi=1,${bankCount} do for si=1,__bankExpected[bi] do local __poolIndex=__wsCanonicalBanks[bi][si];if __WSAT_type(__poolIndex)~="number" or __poolIndex%1~=0 or __poolIndex<1 or __poolIndex>${handlerList.length} then __WSAT_error("WSF_DIAG_BANK_MANIFEST",0) end end end
+ for logical=1,${bankCount} do local active=bankPermutation[logical];${bankArrayName}[active]=__wsCanonicalBanks[logical] end
+ __wsBankPermutation=bankPermutation
+
+ -- Decode dispatch ciphertext into a fresh map. No decoded manifest array is
+ -- retained between rotations.
+ local nextDispatch={}
+ local previous=${tagFnName}Keys[16]%256
+ local previousCheck=${tagFnName}Keys[1]%256
+ local b0,b1,b2,bId,sId=0,0,0,0,0
+ local seenTags={};local records=0
+ for i=1,#${dispatchBlobName} do
+  local cipher=bit32.bxor(__WSAT_byte(${dispatchBlobName},i),__WSAT_byte(${dispatchBlobNameB},i))
+  local k1=${tagFnName}Keys[((i-1)%16)+1];local k2=${tagFnName}Keys[((i+6)%16)+1]
+  local mask=(k1+i*17+previous*3+bit32.bxor(k2,i*29))%256
+  local plain=bit32.bxor(cipher,mask);previous=cipher
+  local col=(i-1)%6
+  if col==0 then b0=plain elseif col==1 then b1=plain elseif col==2 then b2=plain elseif col==3 then bId=plain elseif col==4 then sId=plain else
+   records=records+1
+   local check=plain;local tag=b0*65536+b1*256+b2
+   local want=(b0*3+b1*5+b2*7+bId*11+sId*13+records*17+((b0*b1+b2*bId+sId*records)%251)+previousCheck*19)%256
+   if check~=want or bId<1 or bId>${bankCount} or sId<1 or sId>(__bankExpected[bId] or 0) or seenTags[tag] then __WSAT_error("WSF_DIAG_DISPATCH_MANIFEST",0) end
+   local activeBank=bankPermutation[bId]
+   local bank=${bankArrayName}[activeBank];local poolIndex=bank and bank[sId]
+   if __WSAT_type(poolIndex)~="number" or poolIndex%1~=0 or poolIndex<1 or poolIndex>${handlerList.length} then __WSAT_error("WSF_DIAG_INVALID_VM_HANDLER",0) end
+   seenTags[tag]=true;nextDispatch[tag]=activeBank*256+sId;previousCheck=check
+  end
+ end
+ if records~=${VM_OP_LIST.length+1} then __WSAT_error("WSF_DIAG_DISPATCH_MANIFEST",0) end
+ ${dispatchName}=nextDispatch
+end
+local function __wsRotateDispatch()
+ __wsDispatchRotation=__wsDispatchRotation+1
+ if __wsDispatchRotation>=2147483647 then __wsDispatchRotation=1 end
+ local cadenceState=bit32.bxor(__wsRotationSeed,__wsDispatchRotation,${bankManifestSeed})
+ cadenceState=bit32.bxor(cadenceState,bit32.lshift(cadenceState,13));cadenceState=bit32.bxor(cadenceState,bit32.rshift(cadenceState,17));cadenceState=bit32.bxor(cadenceState,bit32.lshift(cadenceState,5))
+ __wsRotationInterval=21+(cadenceState%47)
+ __wsBuildDispatch(__wsDispatchRotation)
+end
+__wsBuildDispatch(0)
+__WSATRegisterCoreTable(${microLookupName});__WSATRegisterCoreTable(${bankArrayName})
+for i=1,${bankCount} do __WSATRegisterCoreTable(__wsCanonicalBanks[i]) end
+-- Only the immutable ordinal lookup is frozen. The bank pointer array and
+-- dispatch snapshot are intentionally replaceable during bounded rotation.
+if __WSAT_freeze then __WSAT_pcall(__WSAT_freeze,${microLookupName}) end
+${microCallName}=function(callMode,a,b,c,bx,sbx)
+ local fn,globalName,memberName
+ if callMode==1 then
+  globalName=${constResolveInline("bx")};fn=g[globalName]
+  if fn==nil then __WSAT_error("WSF_DIAG_MISSING_GLOBAL_CALL: "..__WSAT_tostring(globalName),0) end
+ elseif callMode==2 or callMode==3 then
+  globalName=${constResolveInline("bx")};memberName=${constResolveInline("sbx")};local obj=g[globalName]
+  if callMode==3 then R[a]=obj[memberName];return end
+  if obj==nil then __WSAT_error("WSF_DIAG_MISSING_GLOBAL_MEMBER: "..__WSAT_tostring(globalName).."."..__WSAT_tostring(memberName).." (global missing)",0) end
+  fn=obj[memberName]
+  if fn==nil then __WSAT_error("WSF_DIAG_MISSING_GLOBAL_MEMBER: "..__WSAT_tostring(globalName).."."..__WSAT_tostring(memberName),0) end
+ else fn=R[a] end
+ local n=(b==0 and (__top-a-1) or b-1);if n<0 then n=0 end
+ local ar=table.create(n);for i=1,n do ar[i]=R[a+i] end
+ local meta=__WSClosureMeta[fn];local callRec=nil
+ if meta then
+  callRec={callerProto=P,returnPC=pc,dest=a,expectedResults=c,argCount=n,state="calling",args={}}
+  for ci=1,n do callRec.args[ci]=ar[ci] end
+  __WSCallStack[#__WSCallStack+1]=callRec;__WSPendingCall=callRec
+ end
+ if meta then __WSDirectCallProto=meta.proto end
+ local ret
+ if kind~=2 and meta and __WSSchedulerActive then
+  ret=table.pack(coroutine.yield({tag=__WSCallRequest,frame={proto=meta.proto,upvalues=meta.upvalues,args=table.pack(table.unpack(ar,1,n)),returnPC=pc,dest=a,expectedResults=c}}))
+ else ret=table.pack(fn(table.unpack(ar,1,n))) end
+ __WSDirectCallProto=nil
+ if callRec then callRec.state="returned";callRec.returnCount=ret.n;for ci=1,(callRec.argCount or 0) do callRec.args[ci]=nil end;callRec.args=nil;__WSCallStack[#__WSCallStack]=nil end
+ for i=1,n do ar[i]=nil end;ar=nil
+ local want=(c==0 and ret.n or c-1);if want<0 then want=0 end
+ for i=1,want do R[a+i-1]=ret[i] end
+ for i=want+1,math.max(n,1) do if i>1 then R[a+i-1]=nil end end
+ __top=a+want
+end
+`;
+  engine = engine.slice(0, handlerBlockStart) + microRuntime + engine.slice(handlerBlockEnd);
+  // V8.2.6: periodic identity seals for central local VM functions. These catch
+  // simple rebinding, but not in-place hookfunction patching that preserves identity.
+  const coreSealBlock = `local __wsCoreSealWord=D
+local __wsCoreSealMap=${instructionMapReaderName}
+local __wsCoreSealOpcode=${opcodeResolverName}
+local __wsCoreSealMini=${microExecName}
+local __wsCoreSealTag=${tagFnName}
+local __wsCoreSealBuild=__wsBuildDispatch
+local __wsCoreSealRotate=__wsRotateDispatch
+`;
+  engine = engine.replace('local __lastOp=0;', coreSealBlock + 'local __lastOp=0;');
+  const sealCheck = `if not __WSAT_rawequal(D,__wsCoreSealWord)
+  or not __WSAT_rawequal(${instructionMapReaderName},__wsCoreSealMap)
+  or not __WSAT_rawequal(${opcodeResolverName},__wsCoreSealOpcode)
+  or not __WSAT_rawequal(${microExecName},__wsCoreSealMini)
+  or not __WSAT_rawequal(${tagFnName},__wsCoreSealTag)
+  or not __WSAT_rawequal(__wsBuildDispatch,__wsCoreSealBuild)
+  or not __WSAT_rawequal(__wsRotateDispatch,__wsCoreSealRotate) then
+  __WSAT_error("WSF_INTEGRITY_FAILED",0)
+ end;`;
+  const periodicNeedle = `if __steps%${integrityInterval}==0 then __WSATCheck(__frameCoroutine);`;
+  engine = engine.replace(periodicNeedle, `if __steps%${integrityInterval}==0 then ${sealCheck} __WSATCheck(__frameCoroutine);`);
+
+  engine = engine.replace(
+    '__execHandler(__dispatchOp,a,b,c,bx,sbx)',
+    `__wsDispatchEpoch=__wsDispatchEpoch+1
+if __wsDispatchEpoch%__wsRotationInterval==0 then __wsRotateDispatch() end
+local __wsDispatchTag=${tagFnName}(__dispatchOp)
+local __wsDispatchCode=${dispatchName}[__wsDispatchTag]
+if __WSAT_type(__wsDispatchCode)~="number" then __WSAT_error("WSF_DIAG_INVALID_VM_HANDLER",0) end
+local __wsBankId=__WSAT_floor(__wsDispatchCode/256)
+local __wsBankSlot=__wsDispatchCode%256
+local __wsBank=${bankArrayName}[__wsBankId]
+local __wsPoolIndex=__wsBank and __wsBank[__wsBankSlot]
+local __wsMiniCode=${microProgramPoolName}[__wsPoolIndex]
+if __WSAT_type(__wsMiniCode)~="number" or __wsMiniCode%1~=0 then __WSAT_error("WSF_DIAG_INVALID_VM_HANDLER",0) end
+local __wsRoute=(__dispatchOp+__steps*13+__wsDispatchRotation)%3
+if __wsRoute==0 then
+ ${microExecName}(__wsMiniCode,a,b,c,bx,sbx)
+elseif __wsRoute==1 then
+ local __wsRun=${microExecName};__wsRun(__wsMiniCode,a,b,c,bx,sbx);__wsRun=nil
+else
+ (${microExecName})(__wsMiniCode,a,b,c,bx,sbx)
+end
+__wsMiniCode=nil;__wsPoolIndex=nil;__wsBank=nil;__wsDispatchCode=nil;__wsDispatchTag=nil`
+  );
   engine = engine.replace(/\$\{fields\.([nmkcpuvos])\}/g, (_, key) => fields[key]);
   engine = engine.replace(/\$\{layout\[(\d+)\]\}/g, (_, index) => String(layout[Number(index)]));
   // Rename VM internals per output. This is paired with randomized data-field names below;
   // it is intended to remove stable signatures, not to claim that reverse engineering is impossible.
-  for (const key of Object.keys(names).sort((a,b) => b.length-a.length)) {
-    engine = engine.replace(new RegExp('\\b' + key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'g'), names[key]);
+  const identifierRenames = new Map(Object.entries(names));
+  // Rename identifier tokens only. The previous global regex also rewrote words
+  // inside quoted diagnostics (for example the "op" inside "micro-op"), which
+  // silently corrupted error messages in generated Luau artifacts.
+  engine = engine.replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|--\[\[[\s\S]*?\]\]|--[^\r\n]*|[A-Za-z_][A-Za-z0-9_]*)/g, token => {
+    if (token.startsWith('"') || token.startsWith("'") || token.startsWith("--")) return token;
+    return identifierRenames.get(token) || token;
+  });
+  if (integrityPolicy === "strict") {
+    // Production builds intentionally avoid exposing diagnostic reason strings.
+    engine = engine.replace(/"WSF_DIAG_[^"]*"/g, '"WSF_INTEGRITY_FAILED"');
   }
   engine = engine.replace("__DISPATCH_TREE_CALL__", buildVmDispatchTree(opMap, names, handlerMap));
   /* BUGFIX: drop comment-only template lines BEFORE collapsing to one line. Otherwise a
@@ -3535,9 +4386,93 @@ function prepareVmIR(root, profile = "balanced") {
   delete optimized._fusionProfile;
   delete optimized._opcodeHotspots;
   applyIRControlFlowObfuscation(optimized, profile);
+  // v3 structural pass: permute whole basic blocks per prototype and rewrite
+  // every relative branch. This is a real bytecode-layout transformation, not
+  // identifier/seed regeneration. Compact mode intentionally preserves order.
+  if (profile === "hardened") permuteVmBasicBlocks(optimized);
   validateVmProtoOperands(optimized);
   validateVmCFG(optimized, profile);
   return optimized;
+}
+
+/* Reorder CFG basic blocks while preserving the exact control-flow graph.
+   Branches are relocated to block entries; conditional branches receive an
+   explicit jump for their original fallthrough edge. FORPREP and JMP are
+   unconditional transfers; FORLOOP/TFORLOOP and JMPIF* are conditional. */
+function permuteVmBasicBlocks(proto, depth = 0) {
+  if (!proto || depth > 128 || !Array.isArray(proto.code)) return proto;
+  for (const child of proto.protos || []) permuteVmBasicBlocks(child, depth + 1);
+  const code = proto.code;
+  if (code.length < 6) return proto;
+  const unconditional = new Set(["JMP", "FORPREP"]);
+  const conditional = new Set(["JMPIF", "JMPIFNOT", "FORLOOP", "TFORLOOP"]);
+  const branchOps = new Set([...unconditional, ...conditional]);
+  const leaders = new Set([0]);
+  for (let i = 0; i < code.length; i++) {
+    const ins = code[i];
+    if (branchOps.has(ins.op)) {
+      const target = i + 1 + Number(ins.sbx || 0);
+      if (target >= 0 && target < code.length) leaders.add(target);
+      if (i + 1 < code.length) leaders.add(i + 1);
+    } else if (ins.op === "RETURN" && i + 1 < code.length) {
+      leaders.add(i + 1);
+    }
+  }
+  const starts = [...leaders].sort((a, b) => a - b);
+  const blocks = starts.map((start, i) => ({
+    start,
+    end: i + 1 < starts.length ? starts[i + 1] : code.length,
+    instructions: code.slice(start, i + 1 < starts.length ? starts[i + 1] : code.length)
+  }));
+  if (blocks.length < 3) return proto;
+  const byStart = new Map(blocks.map(b => [b.start, b]));
+  // Keep the entry block first. Randomize only the remaining blocks.
+  const order = blocks.slice(1);
+  for (let i = order.length - 1; i > 0; i--) {
+    const j = Math.floor(secureRandomFloat() * (i + 1));
+    [order[i], order[j]] = [order[j], order[i]];
+  }
+  const arranged = [blocks[0], ...order];
+  const outputStart = new Map();
+  let cursor = 0;
+  for (const block of arranged) {
+    outputStart.set(block.start, cursor);
+    const last = block.instructions[block.instructions.length - 1];
+    const needsFallthrough = block.end < code.length &&
+      !unconditional.has(last.op) && last.op !== "RETURN";
+    cursor += block.instructions.length + (needsFallthrough ? 1 : 0);
+  }
+  const out = [];
+  for (const block of arranged) {
+    const blockOutStart = out.length;
+    const copied = block.instructions.map(ins => ({ ...ins }));
+    const last = copied[copied.length - 1];
+    const lastOldIndex = block.end - 1;
+    for (let k = 0; k < copied.length; k++) {
+      const oldIndex = block.start + k;
+      const ins = copied[k];
+      if (!branchOps.has(ins.op)) continue;
+      const oldTarget = oldIndex + 1 + Number(ins.sbx || 0);
+      let newTarget;
+      if (oldTarget === code.length) newTarget = cursor;
+      else {
+        const targetBlock = byStart.get(oldTarget);
+        if (!targetBlock) throw new Error("VM block permutation: branch target is not a basic-block leader at " + oldIndex);
+        newTarget = outputStart.get(targetBlock.start);
+      }
+      const newIndex = blockOutStart + k;
+      ins.sbx = newTarget - (newIndex + 1);
+    }
+    out.push(...copied);
+    if (block.end < code.length && !unconditional.has(last.op) && last.op !== "RETURN") {
+      const fallthrough = outputStart.get(block.end);
+      if (!Number.isInteger(fallthrough)) throw new Error("VM block permutation: missing fallthrough block");
+      out.push({ op: "JMP", a: 0, b: 0, c: 0, bx: 0, sbx: fallthrough - (out.length + 1), _blockFallthrough: true });
+    }
+  }
+  if (out.length > 65535) throw new Error("VM block permutation exceeds the supported instruction limit");
+  proto.code = out;
+  return proto;
 }
 
 // IR-level CFG obfuscation: split basic-block entries with semantic no-op JMPs,
@@ -3581,7 +4516,7 @@ function applyIRControlFlowObfuscation(proto, profile = "balanced", depth = 0) {
   // Decoy blocks are appended only when no original branch targets the end sentinel.
   // Existing terminal RETURN keeps them unreachable during normal execution.
   if (!targetsEnd.size && code.length && code.some(ins => ins.op === "RETURN")) {
-    const seed = (secureRandomFloat() * 60000 | 0);
+    const seed = (secureKeyFloat() * 60000 | 0);
     out.push({ op: "LOADBOOL", a: seed % Math.max(1, proto.maxstack || 2), b: seed % 2, c: 0, bx: 0, sbx: 0, _irDead: true });
     out.push({ op: "JMP", a: 0, b: 0, c: 0, bx: 0, sbx: 1, _irDead: true });
     out.push({ op: "LOADNIL", a: 0, b: 0, c: 0, bx: 0, sbx: 0, _irDead: true });
@@ -3735,7 +4670,7 @@ const VM_PORTABLE_HEADER = [
      Previously the engine read bare `_G`, which is empty or missing on executors that expose
      globals through getgenv(). */
   'local __vmenv;',
-  'pcall(function() local cands={} local ok,r=pcall(function() return _G end) if ok and type(r)=="table" then cands[#cands+1]=r end if type(getgenv)=="function" then local ok2,r2=pcall(getgenv) if ok2 and type(r2)=="table" then cands[#cands+1]=r2 end end if type(getfenv)=="function" then for _,lev in ipairs({0,1,2,3}) do local okf,rf=pcall(getfenv,lev);if okf and type(rf)=="table" then cands[#cands+1]=rf end end end if type(shared)=="table" then cands[#cands+1]=shared end local base={pcall=pcall,xpcall=xpcall,type=type,typeof=typeof,tostring=tostring,tonumber=tonumber,assert=assert,error=error,select=select,pairs=pairs,ipairs=ipairs,next=next,rawequal=rawequal,rawget=rawget,rawset=rawset,setmetatable=setmetatable,getmetatable=getmetatable,print=print,warn=warn,math=math,string=string,table=table,bit32=bit32,buffer=buffer,coroutine=coroutine,debug=debug,os=os,task=task,game=game,workspace=workspace,script=script,Enum=Enum,Instance=Instance,Vector2=Vector2,Vector3=Vector3,CFrame=CFrame,Color3=Color3,UDim=UDim,UDim2=UDim2,Ray=Ray,RaycastParams=RaycastParams,BrickColor=BrickColor,NumberRange=NumberRange,NumberSequence=NumberSequence,ColorSequence=ColorSequence,Region3=Region3,Random=Random,DateTime=DateTime,Axes=Axes,Faces=Faces,PhysicalProperties=PhysicalProperties,require=require,loadstring=loadstring,getgenv=getgenv,getfenv=getfenv,setfenv=setfenv,shared=shared,_G=_G,wait=wait,spawn=spawn,delay=delay,tick=tick,time=time,unpack=unpack}; if type(setmetatable)=="function" then __vmenv=setmetatable({}, {__index=function(_,k) for _,c in ipairs(cands) do local v=c[k];if v~=nil then return v end end return base[k] end}) else __vmenv=base for _,c in ipairs(cands) do for k,v in pairs(c) do if __vmenv[k]==nil then __vmenv[k]=v end end end end end)', 
+  '-- VM capabilities are bound by buildVmPortableHeader from a fixed allowlist.',
   'if type(__vmenv)~="table" then __vmenv={} end if __vmenv.print==nil and type(print)=="function" then __vmenv.print=print end',
   'local __unpack=table.unpack or unpack',
   'local __pack=table.pack or function(...) return {n=select("#",...),...} end',
@@ -3770,7 +4705,8 @@ function mangleVmPrivateIdentifiers(source) {
   // Keep strings and comments byte-for-byte; only Lua identifier tokens are rewritten.
   return source.replace(/("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|--\[\[[\s\S]*?\]\]|--[^\r\n]*|[A-Za-z_][A-Za-z0-9_]*)/g, token => {
     if (token.startsWith("\"") || token.startsWith("'") || token.startsWith("--")) return token;
-    if (token !== "__vmenv" && !token.startsWith("__WS")) return token;
+    const randomizedPortableNames = new Set(["__vmenv", "__buf", "__bit", "__unpack", "__pack", "__idiv", "__WSBufferView"]);
+    if (!randomizedPortableNames.has(token) && !token.startsWith("__WS")) return token;
     if (!map.has(token)) map.set(token, makeName());
     return map.get(token);
   });
@@ -3797,14 +4733,49 @@ function manglePortableBitFallback(header) {
   return header.slice(0, start) + segment + header.slice(end);
 }
 
-function portableVmChunk(body) {
+function buildVmPortableHeader(vmEnvironment = "roblox") {
+  // Every mode uses an explicit capability table. No ambient environment scan,
+  // debug library, dynamic source loader, or executor environment API is exposed.
+  // The standard buffer library remains available for Luau compatibility; it is
+  // a language capability, not a security boundary or a secrecy mechanism.
+  const core = [
+    "pcall", "xpcall", "type", "typeof", "tostring", "tonumber", "assert", "error",
+    "select", "pairs", "ipairs", "next", "rawequal", "rawget", "rawset",
+    "setmetatable", "getmetatable", "print", "warn", "math", "string", "table",
+    "bit32", "buffer", "coroutine", "unpack"
+  ];
+  const roblox = [
+    "os", "task", "game", "workspace", "script", "Enum", "Instance", "Vector2",
+    "Vector3", "CFrame", "Color3", "UDim", "UDim2", "Ray", "RaycastParams",
+    "BrickColor", "NumberRange", "NumberSequence", "ColorSequence", "Region3",
+    "Random", "DateTime", "Axes", "Faces", "PhysicalProperties", "require",
+    "wait", "spawn", "delay", "tick", "time"
+  ];
+  const extended = [
+    ...roblox, "utf8", "Vector2int16", "Vector3int16", "TweenInfo", "PathWaypoint",
+    "OverlapParams", "CatalogSearchParams", "DockWidgetPluginGuiInfo"
+  ];
+  const selected = vmEnvironment === "strict"
+    ? core
+    : (vmEnvironment === "extended" ? [...core, ...extended] : [...core, ...roblox]);
+  const unique = [...new Set(selected)];
+  const bindings = unique.map(name => name === "buffer" ? `${name}=__WSBufferView` : `${name}=${name}`).join(",");
+  const helpers = VM_PORTABLE_HEADER.split("\n").slice(3).join("\n");
+  // Copy the standard API so scripts cannot replace methods on the native global
+  // table used by the VM. Freeze the user-facing copy where the runtime supports it.
+  const bufferView = 'local __WSBufferView=(function() local src=buffer;if type(src)~="table" then return src end;local view={};for k,v in pairs(src) do view[k]=v end;if type(table.freeze)=="function" then pcall(table.freeze,view) end;return view end)();\n';
+  const header = bufferView + `local __vmenv={${bindings}};\n${helpers}\nif __vmenv.buffer==nil then __vmenv.buffer=__buf end`;
+  return manglePortableBitFallback(header);
+}
+
+function portableVmChunk(body, options = {}) {
   const rewritten = body
     .replace(/\bbuffer\./g, "__buf.")
     .replace(/\bbit32\./g, "__bit.")
     .replace(/\btable\.unpack\(/g, "__unpack(")
     .replace(/\btable\.pack\(/g, "__pack(");
-  const hardenedHeader = manglePortableBitFallback(VM_PORTABLE_HEADER);
-  return mangleVmPrivateIdentifiers(hardenedHeader + rewritten);
+  const hardenedHeader = buildVmPortableHeader(options.vmEnvironment || "roblox");
+  return mangleVmPrivateIdentifiers(hardenedHeader + "\n" + rewritten);
 }
 
 /* BUGFIX v8.1-34 (compatibility): an integrity mismatch used to `return` silently at the top
@@ -3842,10 +4813,10 @@ function emitVirtualizedLuau(src, opts) {
   // The graph is build-time metadata for diagnostics; it never changes bytecode order.
   if (opts && opts.vmDebug && typeof window !== "undefined") {
     window.__wsLastInterproceduralGraph = interproceduralGraph;
-    window.__wsLastHardeningProfile = { profile, instructionCount:(function count(p){return (p.code||[]).length+(p.protos||[]).reduce((n,c)=>n+count(c),0)})(proto), features:["randomized-opcode-map","nested-isa","lazy-constant-decoding","fragmented-runtime-strings","nonlinear-register-feistel","cfg-edge-obfuscation","superinstruction-fusion","static-payload-digest","circular-execution-integrity-ring","call-frame-transition-checks"] };
+    window.__wsLastHardeningProfile = { profile, instructionCount:(function count(p){return (p.code||[]).length+(p.protos||[]).reduce((n,c)=>n+count(c),0)})(proto), features:["randomized-opcode-map","nested-isa","lazy-constant-decoding","fragmented-runtime-strings","nonlinear-register-feistel","cfg-edge-obfuscation","superinstruction-fusion","typed-length-delimited-payload-digest","circular-execution-integrity-ring","call-frame-transition-checks","roblox-whitelisted-vm-environment"] };
   }
   const runtimeBinding = !!(opts && opts.runtimeBinding);
-  const maskBase = (secureRandomFloat() * 255 | 0) + 1;
+  const maskBase = (secureKeyFloat() * 255 | 0) + 1;
   // This stable Luau primitive-contract fingerprint is a compatibility gate, not a secret.
   const runtimeEnvExpectedKey = [6,1,1,87,170,6,8,8,8,8,8,8,8,8].reduce((z,v) => (z * 31 + v) % 65521, 0);
   // Encoded words/constants use the effective mask; the VM recomputes it from the
@@ -3853,20 +4824,20 @@ function emitVirtualizedLuau(src, opts) {
   const mask = runtimeBinding ? (maskBase ^ (runtimeEnvExpectedKey & 255)) : maskBase;
   // Independent per-build XOR polynomial for instruction words and string constants.
   const xorProfile = {
-    a: 1 + (secureRandomFloat() * 250 | 0), b: 1 + (secureRandomFloat() * 250 | 0),
-    c: 1 + (secureRandomFloat() * 250 | 0), d: 2 + (secureRandomFloat() * 13 | 0),
-    e: 2 + (secureRandomFloat() * 13 | 0), f: 1 + (secureRandomFloat() * 250 | 0),
-    g: 1 + (secureRandomFloat() * 250 | 0),
-    ka: 1 + (secureRandomFloat() * 250 | 0), kb: 1 + (secureRandomFloat() * 250 | 0),
-    kc: 1 + (secureRandomFloat() * 250 | 0), kd: 1 + (secureRandomFloat() * 250 | 0),
-    ke: 2 + (secureRandomFloat() * 13 | 0), kf: 1 + (secureRandomFloat() * 250 | 0),
-    kg: 1 + (secureRandomFloat() * 250 | 0),
-    ca: 1 + (secureRandomFloat() * 250 | 0), cb: 1 + (secureRandomFloat() * 250 | 0),
-    cc: 1 + (secureRandomFloat() * 250 | 0), cd: 1 + (secureRandomFloat() * 250 | 0),
-    ce: 1 + (secureRandomFloat() * 250 | 0), cf: 1 + (secureRandomFloat() * 250 | 0),
-    cg: 1 + (secureRandomFloat() * 250 | 0), ch: 1 + (secureRandomFloat() * 250 | 0),
-    ci: 2 + (secureRandomFloat() * 13 | 0), cj: 1 + (secureRandomFloat() * 250 | 0),
-    ck: 1 + (secureRandomFloat() * 250 | 0)
+    a: 1 + (secureKeyFloat() * 250 | 0), b: 1 + (secureKeyFloat() * 250 | 0),
+    c: 1 + (secureKeyFloat() * 250 | 0), d: 2 + (secureKeyFloat() * 13 | 0),
+    e: 2 + (secureKeyFloat() * 13 | 0), f: 1 + (secureKeyFloat() * 250 | 0),
+    g: 1 + (secureKeyFloat() * 250 | 0),
+    ka: 1 + (secureKeyFloat() * 250 | 0), kb: 1 + (secureKeyFloat() * 250 | 0),
+    kc: 1 + (secureKeyFloat() * 250 | 0), kd: 1 + (secureKeyFloat() * 250 | 0),
+    ke: 2 + (secureKeyFloat() * 13 | 0), kf: 1 + (secureKeyFloat() * 250 | 0),
+    kg: 1 + (secureKeyFloat() * 250 | 0),
+    ca: 1 + (secureKeyFloat() * 250 | 0), cb: 1 + (secureKeyFloat() * 250 | 0),
+    cc: 1 + (secureKeyFloat() * 250 | 0), cd: 1 + (secureKeyFloat() * 250 | 0),
+    ce: 1 + (secureKeyFloat() * 250 | 0), cf: 1 + (secureKeyFloat() * 250 | 0),
+    cg: 1 + (secureKeyFloat() * 250 | 0), ch: 1 + (secureKeyFloat() * 250 | 0),
+    ci: 2 + (secureKeyFloat() * 13 | 0), cj: 1 + (secureKeyFloat() * 250 | 0),
+    ck: 1 + (secureKeyFloat() * 250 | 0)
   };
   // Add a bounded number of unreachable, valid decoy prototypes. Scale the count
   // with actual live bytecode rather than adding 16–32 decoys to every tiny script.
@@ -3908,9 +4879,21 @@ function emitVirtualizedLuau(src, opts) {
   const layout = [0,1,2,3,4,5];
   if (profile !== "compact") for (let i=layout.length-1;i>0;i--) { const j=secureRandomFloat()*(i+1)|0; [layout[i],layout[j]]=[layout[j],layout[i]]; }
   const fieldName = () => "_" + (secureRandomFloat().toString(36).slice(2,5)) + (secureRandomFloat()*900+100|0);
-  const fields = {n:fieldName(),m:fieldName(),k:fieldName(),kt:fieldName(),kb:fieldName(),c:fieldName(),im:fieldName(),p:fieldName(),u:fieldName(),s:fieldName(),s2:fieldName(),v:fieldName(),o:fieldName(),x:fieldName(),y:fieldName(),r1:fieldName(),r2:fieldName(),r3:fieldName(),q1:fieldName(),q2:fieldName(),cs:fieldName(),oo:fieldName()};
+  const fields = {n:fieldName(),m:fieldName(),k:fieldName(),kt:fieldName(),kb:fieldName(),c:fieldName(),im:fieldName(),p:fieldName(),u:fieldName(),s:fieldName(),s2:fieldName(),v:fieldName(),o:fieldName(),o2:fieldName(),oo:fieldName(),wp:fieldName(),cp:fieldName(),meta:fieldName()};
+  fields.metaReadName = fieldName();
+  fields.metaGroupName = fieldName();
+  const metaGroupSlots=[1,2,3,4];
+  for(let i=metaGroupSlots.length-1;i>0;i--){const j=secureRandomFloat()*(i+1)|0;[metaGroupSlots[i],metaGroupSlots[j]]=[metaGroupSlots[j],metaGroupSlots[i]];}
+  const metaItemSlots=[[1,2,3],[1,2,3,4,5,6],[1],[1]];
+  for(const row of metaItemSlots){for(let i=row.length-1;i>0;i--){const j=secureRandomFloat()*(i+1)|0;[row[i],row[j]]=[row[j],row[i]];}}
+  fields.metaLayout={groupSlots:metaGroupSlots,itemSlots:metaItemSlots};
   const names = {};
-  for (const id of ["__WSV","__WSN","__mbaAdd","__mbaTruthy","__XM","R","U","pc","g","done","res","S","sp","__push","__pop","args","__NP","__top","D","K","H","IH","__VR","__vrmul","__vradd","__vrxor","__regkey","__fsp","__stackSalt","__dfstate","__di","__slot","__lastOp","__dispatchState","__dispatchOp","op","a","b","c","bx","sbx"]) names[id] = fieldName();
+  for (const id of ["__WSV","__WSN","__mbaAdd","__mbaTruthy","__XM","R","U","pc","g","done","res","S","sp","__push","__pop","args","__NP","__top","D","K","H","IH","__VR","__vrmul","__vradd","__vrxor","__regkey","__fsp","__stackSalt","__dfstate","__di","__slot","__lastOp","__dispatchState","__dispatchOp","__execHandler","op","a","b","c","bx","sbx"]) names[id] = fieldName();
+  // V8.2.6: randomize every lower-case __ws* identifier used in generated VM templates.
+  for (const match of buildLuauVmEngine.toString().matchAll(/\b__ws[A-Za-z0-9_]*\b/g)) {
+    const id = match[0];
+    if (!names[id]) names[id] = fieldName();
+  }
   const opShift = profile === "compact" ? 1 : 1 + (secureRandomFloat() * 249 | 0);
   const opShift2 = profile === "compact" ? 0 : 1 + (secureRandomFloat() * 249 | 0);
   const innerOpMap = profile === "compact" ? opMap : makeVmOpcodeMap(profile);
@@ -3937,24 +4920,24 @@ function emitVirtualizedLuau(src, opts) {
   const innerLayout = [0,1,2,3,4,5];
   if (profile !== "compact") for (let i=innerLayout.length-1;i>0;i--) { const j=secureRandomFloat()*(i+1)|0; [innerLayout[i],innerLayout[j]]=[innerLayout[j],innerLayout[i]]; }
   /* Independent second-layer masks for nested constants and instruction payload. */
-  const nestedKeyMask = 1 + (secureRandomFloat() * 254 | 0);
-  let nestedPayloadMask = (secureRandomFloat() * 0xFFFFFFFF) >>> 0;
+  const nestedKeyMask = 1 + (secureKeyFloat() * 254 | 0);
+  let nestedPayloadMask = (secureKeyFloat() * 0xFFFFFFFF) >>> 0;
   if (nestedPayloadMask === 0) nestedPayloadMask = 0x6D2B79F5;
   const ser = serializeProtoNumeric(proto, opMap, layout, opShift, innerOpMap, false, innerLayout, xorProfile, handlerMap, profile, opShift2);
   validateSerializedVmProto(proto, ser, opMap, "root");
   // Split the per-output byte mask across unrelated-looking arithmetic terms.
   // This obscures a fixed literal but is not cryptographic protection.
-  const ka = 3 + ((secureRandomFloat() * 240) | 0);
-  const kb = 5 + ((secureRandomFloat() * 230) | 0);
-  const kc = 7 + ((secureRandomFloat() * 220) | 0);
+  const ka = 3 + ((secureKeyFloat() * 240) | 0);
+  const kb = 5 + ((secureKeyFloat() * 230) | 0);
+  const kc = 7 + ((secureKeyFloat() * 220) | 0);
   const kd = (((mask - (ka * kb) - kc) % 256) + 256) % 256;
   const maskExpr = `(((${ka}*${kb})+${kc}+${kd})%256)`;
   // Affine virtual-register addressing. The proxy keeps logical register
   // semantics (including adjacent argument/result registers) while storing
   // values in build-specific physical slots. 65521 is prime; multiplier is nonzero.
-  const vrMul = 1 + (secureRandomFloat() * 65519 | 0);
-  const vrAdd = secureRandomFloat() * 65521 | 0;
-  const vrXor = secureRandomFloat() * 65535 | 0;
+  const vrMul = 1 + (secureKeyFloat() * 65519 | 0);
+  const vrAdd = secureKeyFloat() * 65521 | 0;
+  const vrXor = secureKeyFloat() * 65535 | 0;
   const wn = { fi: fieldName(), fb: fieldName(), fp: fieldName() };
   // Safe loop budget can be tuned by callers. Clamp it to a reasonable range
   // so accidental settings cannot disable the guard or make it trivially tiny.
@@ -3964,7 +4947,7 @@ function emitVirtualizedLuau(src, opts) {
     : 1000000;
   let engine;
   __wsTimingNoiseBuild = !!(opts && opts.timingNoise);
-  try { engine = buildLuauVmEngine(mask, opMap, innerOpMap, handlerMap, fields, names, layout, innerLayout, maskExpr, vrMul, vrAdd, vrXor, opShift, nestedPayloadMask, nestedKeyMask, xorProfile, integrity ? wn.fp : null, instructionBudget, opShift2, runtimeBinding, maskBase, runtimeEnvExpectedKey, opts && opts.integrityPolicy === "strict" ? "strict" : "diagnostic"); }
+  try { engine = buildLuauVmEngine(mask, opMap, innerOpMap, handlerMap, fields, names, layout, innerLayout, maskExpr, vrMul, vrAdd, vrXor, opShift, nestedPayloadMask, nestedKeyMask, xorProfile, integrity ? wn.fp : null, instructionBudget, opShift2, runtimeBinding, maskBase, runtimeEnvExpectedKey, opts && opts.integrityPolicy === "diagnostic" ? "diagnostic" : "strict", opts && opts.antiHookMode || "strict"); }
   finally { __wsTimingNoiseBuild = false; }
   const digest = makeDigest(chooseMetamorphicIntegrityProfile(), chooseMetamorphicIntegrityProfile());
   const payloadBody = emitProtoTable(ser, mask, fields, digest, nestedPayloadMask, nestedKeyMask, xorProfile);
@@ -3976,7 +4959,7 @@ function emitVirtualizedLuau(src, opts) {
   if (!integrity) {
     return portableVmChunk(engine +
       " local " + pRoot + "=" + payload +
-      " return __WSRun(" + pRoot + ",{})");
+      " return __WSRun(" + pRoot + ",{})", opts || {});
   }
   // Fail closed on integrity mismatch without kicking users or installing debugger
   // hooks/watchdogs. The payload digest is computed at build time and rechecked by
@@ -3988,7 +4971,7 @@ function emitVirtualizedLuau(src, opts) {
     " error(" + luaHiddenString("Payload integrity check failed") + ",0) end";
   return portableVmChunk(integrityWalkerLua(fields, wn, digest.profile, digest.profile2) + engine +
     " local " + pRoot + "=" + payload + tamperAction +
-    " return __WSRun(" + pRoot + ",{})");
+    " return __WSRun(" + pRoot + ",{})", opts || {});
 }
 
 
@@ -4025,21 +5008,15 @@ function chunkStringExpr(s) {
    bytes; the real names exist only transiently in the running VM. Env
    capture (__env) and the overall _G_ proxy shape are unchanged from <4. */
 function buildGlobalProxyHeader(level) {
-  /* BUGFIX v8.1-35 (executor sandboxes): the old capture used `_G` or `getfenv(0)` only. In
-     environments where `_G` is missing or empty (e.g. Delta exposing globals via getgenv()),
-     __env stayed an empty table and every global call failed with
-     "attempt to call a nil value (field 'p')". Candidates are now tried in order
-     (_G, getgenv(), getfenv(0)); the first one that actually provides `print` wins. */
-  // Keep all discovered environments available. Selecting only the first table
-  // containing print loses executor-only globals (e.g. addcmd) that may live in
-  // getgenv() while print is available in _G. Resolve each name across candidates.
-  const envCapture = "local __env;pcall(function() local cands={} " +
-    "local ok,r=pcall(function() return _G end) if ok and type(r)=='table' then cands[#cands+1]=r end " +
-    "if type(getgenv)=='function' then local ok2,r2=pcall(getgenv) if ok2 and type(r2)=='table' then cands[#cands+1]=r2 end end " +
-    "if type(getfenv)=='function' then local ok3,r3=pcall(getfenv,0) if ok3 and type(r3)=='table' then cands[#cands+1]=r3 end end " +
-    "if type(setmetatable)=='function' then __env=setmetatable({}, {__index=function(_,k) for _,c in ipairs(cands) do local v=c[k];if v~=nil then return v end end return nil end}) " +
-    "else __env={} for _,c in ipairs(cands) do for k,v in pairs(c) do if __env[k]==nil then __env[k]=v end end end end end);" +
-    "if type(__env)~='table' then __env={} end;if __env.print==nil and type(print)=='function' then __env.print=print end;";
+  // Bind only the globals that applyGlobalAlias can rewrite. Do not enumerate or
+  // merge _G/getgenv/getfenv/shared environments: that creates an unnecessary
+  // capability-expansion path and makes executor-only APIs reachable indirectly.
+  // Direct references preserve normal Luau/Roblox resolution for the supported
+  // aliases while keeping the proxy's backing table finite and auditable.
+  const allowed = Object.keys(GLOBAL_ALIAS);
+  const envCapture = "local __env={" +
+    allowed.map(name => name + "=" + name).join(",") +
+    "};";
 
   if (level < 4) {
     const entries = [];
@@ -4273,7 +5250,7 @@ function applyGlobalAlias(src) {
    cannot observe another seed. For cancellation, combine this with AbortSignal
    patterns: check signal.aborted between steps and stop without touching shared
    state. */
-function withSeed(seed, fn) {
+function withSeed(seed, fn, allowDeterministicKeys = false) {
   if (typeof fn !== "function") throw new TypeError("withSeed expects a function");
   // Async functions must be rejected before invocation: throwing after they return
   // a Promise cannot cancel their already-started continuation.
@@ -4283,18 +5260,25 @@ function withSeed(seed, fn) {
   const rng = makeRng(String(seed));
   const orig = Math.random;
   const priorSeededRandom = __wsSeededRandom;
+  const priorKeyOptIn = __wsDeterministicKeyOptIn;
   __wsSeededRandom = rng;
+  __wsDeterministicKeyOptIn = allowDeterministicKeys === true;
   Math.random = rng;
   try {
     return fn();
   } finally {
     Math.random = orig;
     __wsSeededRandom = priorSeededRandom;
+    __wsDeterministicKeyOptIn = priorKeyOptIn;
   }
 }
 
 function obf(src, opts) {
-  return withSeed(opts && opts.seed, () => obfImpl(src, opts));
+  const hasSeed = !!(opts && opts.seed !== undefined && opts.seed !== null && opts.seed !== "");
+  if (hasSeed && !(opts && opts.allowDeterministic === true)) {
+    throw new Error("Deterministic builds are debug-only. Set allowDeterministic:true to explicitly permit predictable output; never use that output as a production protection build.");
+  }
+  return withSeed(opts && opts.seed, () => obfImpl(src, opts), !!(opts && opts.allowDeterministic === true));
 }
 
 /* v15.5: rename recognizable VM implementation identifiers without touching string literals.
@@ -4700,8 +5684,8 @@ function __wsBuildForcedSourceGuard() {
 /* Build-time source prelude: these Luau checks are prepended to the user's source
    BEFORE macro preprocessing, parsing, renaming, string encoding, CFF and/or VM
    compilation. Thus they travel through the same obfuscation pipeline as user code.
-   This detects selected primitive replacement/behavior changes only; it cannot
-   identify every executor hook or prove that the client process is untampered. */
+   The error/pcall sentinel and primitive behavior probes detect selected tampering,
+   but are not a trusted anti-debug boundary and cannot prove client integrity. */
 function __wsBuildObfuscatedProtectionSource() {
   const used = new Set();
   const id = () => {
@@ -4711,8 +5695,8 @@ function __wsBuildObfuscatedProtectionSource() {
     used.add(value);
     return value;
   };
-  const [ty, pc, er, mt, st, tb, ok, a, b, c, d, e, f, g, h] = Array.from({length: 16}, id);
-  return `do local ${ty}=type;local ${pc}=pcall;local ${er}=error;local ${mt}=math;local ${st}=string;local ${tb}=table;local ${ok},${a},${b},${c},${d},${e}=${pc}(function() return ${ty}(${ty}),${ty}(${pc}),${ty}(${mt}),${ty}(${st}),${ty}(${tb}) end);if not ${ok} or ${a}~="function" or ${b}~="function" or ${c}~="table" or ${d}~="table" or ${e}~="table" then ${er}("WSF_ANTITAMPER_PRIMITIVE_CHECK",0) end;local ${ok},${f},${g},${h}=${pc}(function() return ${mt}.floor(3.75),${st}.byte("WSF",2),${tb}.concat({"W","S","F"}) end);if not ${ok} or ${f}~=3 or ${g}~=83 or ${h}~="WSF" then ${er}("WSF_ANTITAMPER_BEHAVIOR_CHECK",0) end;local ${ok},${a},${b}=${pc}(function() return ${ty}(1),${ty}("x") end);if not ${ok} or ${a}~="number" or ${b}~="string" then ${er}("WSF_ANT_HOOK_TYPE_CHECK",0) end end;`;
+  const [ty, pc, er, mt, st, tb, ok, a, b, c, d, e, f, g, h, marker, threw, reason] = Array.from({length: 19}, id);
+  return `do local ${ty}=type;local ${pc}=pcall;local ${er}=error;local ${mt}=math;local ${st}=string;local ${tb}=table;local ${ok},${a},${b},${c},${d},${e}=${pc}(function() return ${ty}(${ty}),${ty}(${pc}),${ty}(${mt}),${ty}(${st}),${ty}(${tb}) end);if not ${ok} or ${a}~="function" or ${b}~="function" or ${c}~="table" or ${d}~="table" or ${e}~="table" then ${er}("WSF_ANTITAMPER_PRIMITIVE_CHECK",0) end;local ${ok},${f},${g},${h}=${pc}(function() return ${mt}.floor(3.75),${st}.byte("WSF",2),${tb}.concat({"W","S","F"}) end);if not ${ok} or ${f}~=3 or ${g}~=83 or ${h}~="WSF" then ${er}("WSF_ANTITAMPER_BEHAVIOR_CHECK",0) end;local ${ok},${a},${b}=${pc}(function() return ${ty}(1),${ty}("x") end);if not ${ok} or ${a}~="number" or ${b}~="string" then ${er}("WSF_ANT_HOOK_TYPE_CHECK",0) end;local ${marker}="WSF_ERROR_SENTINEL";local ${threw},${reason}=${pc}(function() ${er}(${marker},0) end);if ${threw} or ${reason}~=${marker} then ${er}("WSF_ANT_ERROR_SEMANTICS",0) end end;`;
 }
 
 function obfImpl(src, opts) {
@@ -4733,7 +5717,7 @@ function obfImpl(src, opts) {
   src = sourceDirectiveText + __wsBuildObfuscatedProtectionSource() + "\n" + src;
   const requestedSettings = { level: +opts.level, name: !!opts.name, str: !!opts.str, strictStrings: opts.strictStrings !== false,
     runtimeXor: opts.runtimeXor !== false, runtimeBinding: !!opts.runtimeBinding, dead: !!opts.dead, flow: !!opts.flow, vm: !!opts.vm, autoVmSize: opts.autoVmSize !== false,
-    profile: opts.profile || "balanced", vmDebug: !!opts.vmDebug, timingNoise: !!opts.timingNoise, sourceMap: !!opts.sourceMap,
+    profile: opts.profile || "balanced", vmEnvironment: opts.vmEnvironment || "roblox", vmDebug: !!opts.vmDebug, timingNoise: !!opts.timingNoise, sourceMap: !!opts.sourceMap,
     cmt: !!opts.cmt, kw: opts.kw !== false, constWrap: !!opts.constWrap };
   let { level, name, str, dead, flow, cmt } = opts;
   /* FIX #3 #15 */
@@ -4742,6 +5726,11 @@ function obfImpl(src, opts) {
   let sourceLite = false;
   let vmFallbackReason = null; /* BUGFIX v8.1-33: surfaced in the UI when VM build falls back */
   const warnings = [];         /* v8.1-40: non-fatal problems shown in the status line */
+  opts.integrityPolicy = opts.integrityPolicy === "diagnostic" ? "diagnostic" : "strict";
+  opts.antiHookMode = ["strict","balanced","off"].includes(opts.antiHookMode) ? opts.antiHookMode : "strict";
+  const deterministicBuild = opts.seed !== undefined && opts.seed !== null && opts.seed !== "";
+  if (deterministicBuild) warnings.push("deterministic seed mode is enabled by explicit debug opt-in: output keys become predictable and must never be used for production protection");
+  if (opts.vmEnvironment === "extended") warnings.push("extended VM environment exposes additional Roblox compatibility globals, but still excludes debug and dynamic environment/source-loader APIs");
   if (opts.runtimeBinding && !useVm) warnings.push("runtime contract key binding is VM-only; enable Bytecode VM to activate it");
   if (typeof window !== "undefined") window.__wsTimingNoiseEnabled = !!opts.timingNoise;
   let hideKw = opts.kw !== false;
@@ -4792,7 +5781,7 @@ function obfImpl(src, opts) {
       // generator and are never sourced from the visible input editor. vmDebug may
       // change diagnostics, but it must not disable the generated integrity layer.
       if (opts.vmDebug) warnings.push("forced hidden VM integrity remains enabled; VM diagnostic mode does not disable runtime checks");
-      let vout = "do " + emitVirtualizedLuau(vsrc, { integrity: true, profile: opts.profile, timingNoise: !!opts.timingNoise, runtimeBinding: !!opts.runtimeBinding, integrityPolicy: opts.integrityPolicy }) + " end";
+      let vout = "do " + emitVirtualizedLuau(vsrc, { integrity: true, profile: opts.profile, vmEnvironment: opts.vmEnvironment || "roblox", timingNoise: !!opts.timingNoise, runtimeBinding: !!opts.runtimeBinding, integrityPolicy: opts.integrityPolicy }) + " end";
       // Compact VM output: do not inject inert padding by default. Optional dead-code
       // padding remains disabled in VM mode because it can dominate output size without
       // improving runtime protection. The payload and dispatch table remain randomized.
@@ -4823,7 +5812,7 @@ function obfImpl(src, opts) {
       // The custom bytecode, opcode mappings, masks, and constant transforms are still
       // produced by emitVirtualizedLuau. This deliberately trades whole-source encoding
       // for compatibility with runtimes where dynamic compilation is disabled.
-      vout = "--[[ this file protected WSFuscate v2 ]]\n" + vout;
+      vout = "-- [[ This File Protected Using WSFuscate V2.21 ]]\n" + vout;
       return {
         code: vout,
         orig: originalSourceLength,
@@ -4833,7 +5822,7 @@ function obfImpl(src, opts) {
         level,
         mode: "vm",
         requestedSettings,
-        appliedOptions: { level, mode: "vm", vm: true, vmProfile: opts.profile || "balanced", stringPipeline: "VM bytecode constant pool and runtime masks", namePipeline: "VM register/opcode mapping", runtimeBinding: !!opts.runtimeBinding, timingNoise: !!opts.timingNoise, vmDebug: !!opts.vmDebug, forcedHiddenAntiTamper: true, obfuscatedAntiTamper: true, obfuscatedAntiHook: true },
+        appliedOptions: { level, mode: "vm", vm: true, vmProfile: opts.profile || "balanced", vmEnvironment: opts.vmEnvironment || "roblox", stringPipeline: "VM bytecode constant pool and runtime masks", namePipeline: "VM register/opcode mapping", runtimeBinding: !!opts.runtimeBinding, timingNoise: !!opts.timingNoise, vmDebug: !!opts.vmDebug, forcedHiddenAntiTamper: true, obfuscatedAntiTamper: true, obfuscatedAntiHook: true },
         warnings
       };
     } catch (e) {
@@ -5177,7 +6166,7 @@ function obfImpl(src, opts) {
 
   // Keep the requested attribution banner separate from the compacted payload.
   out = compactLuaSingleLine(stripComments(out));
-  out = strictDirective + "--[[ this file protected WSFuscate v2 ]]\n" + out;
+  out = strictDirective + "-- [[ This File Protected Using WSFuscate V2.21 ]]\n" + out;
 
   warnings.push("built-in anti-tamper and bounded anti-hook Luau checks were prepended before obfuscation and transformed with the input; they are not shown in the input editor and cannot detect every hook");
   warnings.push("hidden generated runtime-integrity guard was injected automatically; it is not shown in the input editor and is not cryptographic anti-tamper protection");
@@ -7285,7 +8274,7 @@ function __wsRenderBuildSummary(result, opts, source) {
   const lines = [
     "모드: " + result.mode + " | Level: " + result.level,
     "VM: " + (result.mode === "vm" ? "사용" : "미사용") + " | profile: " + (a.vmProfile || opts.profile),
-    "Integrity policy: " + (opts.integrityPolicy || "diagnostic"),
+    "Integrity policy: " + (opts.integrityPolicy || "strict"),
     "적용 요청 패스: " + (enabled.length ? enabled.join(", ") : "없음"),
     "입력/출력: " + result.orig + " B → " + result.obf + " B (" + (result.orig ? (result.obf / result.orig).toFixed(2) : "0.00") + "×)",
     "카운트(정적 추정): VM 함수 약 " + vmFunctions + " | 문자열 리터럴 " + stringCount + " | CFF 후보 블록 " + cffCount,
@@ -7324,19 +8313,27 @@ function obfuscateOnServer(source, options = {}) {
     str: options.str !== false,
     strictStrings: options.strictStrings !== false,
     runtimeXor: options.runtimeXor !== false,
-    runtimeBinding: !!options.runtimeBinding,
+    // Hardened server defaults: retain an explicit caller override, but otherwise
+    // select the strongest existing VM profile and enable the runtime-contract
+    // binding layer. These are diversification / tamper-detection layers, not
+    // cryptographic protection; the generated client still contains its decoder.
+    runtimeBinding: true,
     dead: options.dead !== false,
     flow: options.flow !== false,
-    vm: options.vm !== false,
+    vm: true,
     autoVmSize: options.autoVmSize === true,
-    profile: options.profile || "balanced",
+    profile: "hardened",
+    vmEnvironment: ["extended", "strict", "roblox"].includes(options.vmEnvironment) ? options.vmEnvironment : "roblox",
     vmDebug: !!options.vmDebug,
     timingNoise: !!options.timingNoise,
+    maxInstructions: options.maxInstructions,
     cmt: !!options.cmt,
     kw: options.kw !== false,
     constWrap: options.constWrap !== false,
-    seed: options.seed || undefined,
-    integrityPolicy: options.integrityPolicy || "strict"
+    seed: options.seed === undefined || options.seed === null || options.seed === "" ? undefined : options.seed,
+    allowDeterministic: options.allowDeterministic === true,
+    integrityPolicy: "strict",
+    antiHookMode: "strict"
   };
   const r = obf(source, opts);
   const code = typeof r === "string" ? r : String(r && r.code != null ? r.code : "");
@@ -7349,8 +8346,47 @@ function obfuscateOnServer(source, options = {}) {
     mode: (r && r.mode) || "source",
     level: (r && r.level != null) ? r.level : opts.level,
     warnings: Array.isArray(r && r.warnings) ? r.warnings : [],
-    engine: "v2"
+    securityProfile: {
+      vmProfile: opts.profile,
+      runtimeBinding: opts.runtimeBinding,
+      buildRandomness: opts.seed !== undefined && opts.seed !== null && opts.seed !== "" ? "explicit deterministic debug opt-in; layout and key streams are reproducible and predictable" : "layout stream plus independent cryptographic key stream",
+      integrity: opts.vm,
+      integrityPolicy: opts.integrityPolicy,
+      antiHookMode: opts.antiHookMode || "strict",
+      serverOnlyBuild: true,
+      maxInstructions: Number.isFinite(Number(opts.maxInstructions))
+        ? Math.max(1000, Math.min(100000000, Math.floor(Number(opts.maxInstructions))))
+        : 1000000,
+      handlerLayout: "24-bit Feistel tags -> feedback-decoded split dispatch manifest -> randomized anonymous closure pool -> independently feedback-decoded bank/slot manifest; runtime bank wrappers are created after validation",
+      decoyHandlers: "disabled; invalid slots fail closed",
+      opcodeLayout: "sparse unsigned 32-bit per-prototype opcode IDs, six-byte records (id:u32, handlerSlot:u8, chained check:u8), feedback-encoded and split into two XOR shares; all client-side seeds and decoders remain reversible",
+      constantLayout: "per-prototype masked physical constant-index tree, feedback-chained fragmented strings, on-demand decode with no persistent constant cache",
+      integrityModel: "dual nonlinear rolling payload digest with domain tags, array/buffer length binding, 32-slot primary/shadow runtime ledger, dispatch-manifest checks, and distributed runtime primitive checks; not a cryptographic MAC",
+      integrityFailurePath: "captured error primitive called directly at integrity sites; resists later global error replacement but is not trusted if patched before bootstrap or through privileged closure inspection",
+      vmEnvironment: opts.vmEnvironment || "roblox",
+      globalCapabilityPolicy: opts.vmEnvironment === "extended" ? "extended Roblox allowlist; no debug, getgenv/getfenv/setfenv, loadstring, shared, or _G capture" : (opts.vmEnvironment === "strict" ? "strict pure-Luau allowlist; Roblox services/modules unavailable" : "Roblox allowlist; no debug, getgenv/getfenv/setfenv, loadstring, shared, or _G capture"),
+      bufferCapability: "standard buffer functions remain available through a shallow user-facing copy (frozen where table.freeze exists); the original global buffer is not modified, and privileged code outside the VM boundary cannot be sandboxed by this copy",
+      reflectionBoundary: "debug is excluded from the VM capability table; privileged reflection outside the VM sandbox cannot be reliably disabled by client-side Luau code",
+      sourceGlobalProxy: "fixed direct-reference allowlist; no _G/getgenv/getfenv/shared environment enumeration",
+      integrityRingSlots: 32,
+      microcode: "VM operation implementations are lowered into build-random numeric mini-VM instruction IDs; ordinal, bank, and dispatch structures retain numeric indices; one shared mini-interpreter executes each instruction without creating per-op handler closures; the interpreter's operation semantics remain client-visible and reversible",
+      decoderExposure: "three independently-emitted constant decoders are selected in rotating pairs from inline per-use checks; decoded constant buffers are cleared after conversion; privileged runtime inspection or coordinated patching can still bypass client-side checks",
+      antiHook: "three independent constant-dispatch closures retained only as local references (no enumerable dispatcher array), rotating pairwise equality checks and periodic three-way checks, strong core-table registry, explicit main-thread sentinel, debug bootstrap snapshot, pcall/xpcall/getfenv/setfenv identity checks, frozen dispatch tables where supported; privileged executor-level coordinated patching remains outside the client trust boundary",
+      dispatchExposure: "opcode tags resolve to numeric bank/slot and mini-program indices; a shared mini-interpreter executes the selected numeric instruction; there are no per-op factory closures to dump, but the interpreter logic and numeric program stream remain inspectable, so this is representation-level reverse-engineering friction rather than cryptographic secrecy; bank layouts use epoch-derived permutations rather than a four-state rotation",
+      instructionMap: "per-prototype delta-coded xorshift-feedback byte string with bounded 8-entry runtime cache; offsets are decoded on demand",
+      wordCache: "8-entry direct-mapped decoded-word cache; rewind resets the sequential decoder state before replay",
+      opcodeBlob: "six-byte sparse 32-bit opcode records with chained record checks, emitted as two XOR shares and recombined by the client decoder; representation change, not encryption",
+      dispatchManifest: "feedback-coded manifest split into two XOR shares and cross-validated during reconstruction",
+      reflectionPolicy: "strict mode rejects privileged debug upvalue/local hooks and common executor hook APIs where detectable; rawget/rawset/setmetatable probes, core-table metatable checks, coroutine identity, and captured task.spawn identity are checked",
+      prototypeMetadata: "numeric seeds and coefficients are stored in four physically permuted nested groups with build-random group/item layouts and access through a generated metadata accessor instead of a flat 10-slot vector",
+      serverBuildPolicy: "Node runtime guard; obfuscateOnServer forces VM, hardened profile, strict integrity, runtime binding, and strict anti-hook; module exports only obfuscateOnServer; engine must remain on trusted Node server and never be bundled into public client assets",
+      controlFlowLayout: "per-prototype-basic-block-permutation",
+      branchRelocation: true
+    },
+    engine: "v8.2.6-microbytecode-numeric-banked-dispatch-sealed"
   };
 }
 
-module.exports = { obfuscateOnServer, obf };
+module.exports = Object.freeze({ obfuscateOnServer });
+// Deploy this module only on a trusted Node server. Never bundle this engine into the public client.
+
